@@ -7,31 +7,60 @@ class IntentEncoder(nn.Module):
     """
     Module B: The Intent Encoder (Local Policy).
     Encodes noisy local observations into a latent intent 'z' and predicts future waypoints.
+    [Upgrade] Uses 1D-CNN for Lidar processing + MLP for Ego State.
     """
     def __init__(self, input_dim):
         super(IntentEncoder, self).__init__()
         
         self.hidden_dim = Config.HIDDEN_DIM
         self.intent_dim = Config.INTENT_DIM
+        self.lidar_channels = Config.LIDAR_NUM_LASERS
         
-        # Input Normalization (Critical for RL stability)
+        
+        # Calculate Ego State dimension (Total - Lidar)
+        self.ego_dim = input_dim - self.lidar_channels
+        
+        # 1. Input Normalization
+        # Split normalization for Ego and Lidar usually works better, 
+        # but a global LayerNorm is also acceptable and simpler.
         self.input_norm = nn.LayerNorm(input_dim)
+        
+        
+       # 2. [New] 1D-CNN for Lidar
+        # Logic: Extract geometric features (corners, walls) from sequence
+        # Input: (Batch, 1, 72)
+        self.lidar_cnn = nn.Sequential(
+            # Layer 1: Detect local patterns (e.g., 5 points window)
+            nn.Conv1d(in_channels=1, out_channels=16, kernel_size=5, stride=2, padding=2),
+            nn.ReLU(),
+            # Layer 2: Aggregate features
+            nn.Conv1d(in_channels=16, out_channels=32, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            # Output shape calculation:
+            # 72 -> /2 -> 36 -> /2 -> 18
+            # Flatten dim = 32 channels * 18 points = 576
+        )
+        
+        # Calculate CNN output size dynamically
+        with torch.no_grad():
+            dummy_lidar = torch.zeros(1, 1, self.lidar_channels)
+            cnn_out = self.lidar_cnn(dummy_lidar)
+            self.cnn_flat_dim = cnn_out.view(1, -1).shape[1]
 
-        # Shared Encoder
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, self.hidden_dim),
+        # 3. Feature Fusion (Ego + Lidar_CNN)
+        self.fusion_mlp = nn.Sequential(
+            nn.Linear(self.ego_dim + self.cnn_flat_dim, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
             nn.ReLU(),
             nn.Linear(self.hidden_dim, self.hidden_dim),
             nn.ReLU()
         )
         
+        
         # Head 1: Latent Intent (z)
-        # This is broadcasted to neighbors.
         self.intent_head = nn.Linear(self.hidden_dim, self.intent_dim)
         
-        # Head 2: Auxiliary Task (Future Waypoints)
-        # Predicts N points (x, y) relative to ego.
-        # Output dim = PRED_WAYPOINTS_NUM * 2
+        # Head 2: Auxiliary Task
         self.aux_head = nn.Linear(self.hidden_dim, Config.PRED_WAYPOINTS_NUM * 2)
         
     def forward(self, obs):
@@ -45,15 +74,28 @@ class IntentEncoder(nn.Module):
         """
         # Apply Normalization first
         obs = self.input_norm(obs)
+         
+        # [Crucial] Split Observation into Lidar and Ego State
+        # Assuming Lidar is at the end of the vector (based on env_wrapper.py)
+        lidar = obs[:, -self.lidar_channels:]      # (Batch, 72)
+        ego_state = obs[:, :-self.lidar_channels]  # (Batch, Ego_Dim)
         
-        features = self.encoder(obs)
+        # Pass Lidar through CNN
+        # Reshape for Conv1d: (Batch, Channel=1, Length=72)
+        lidar = lidar.unsqueeze(1) 
+        lidar_feat = self.lidar_cnn(lidar)
+        lidar_feat = lidar_feat.view(lidar_feat.size(0), -1) # Flatten
         
-        # 1. Generate Latent Intent
+        # Concatenate with Ego State
+        combined_feat = torch.cat([ego_state, lidar_feat], dim=1)
+        
+        # Encode
+        features = self.fusion_mlp(combined_feat)
+        
+        # Heads
         z = self.intent_head(features)
-        # Normalize z to keep it bounded (optional but good for stability)
-        z = F.normalize(z, p=2, dim=1)
+        z = F.normalize(z, p=2, dim=1) # Normalize to hypersphere
         
-        # 2. Auxiliary Prediction
         flat_waypoints = self.aux_head(features)
         pred_waypoints = flat_waypoints.view(-1, Config.PRED_WAYPOINTS_NUM, 2)
         
@@ -71,18 +113,23 @@ class GraphAttention(nn.Module):
         
         self.intent_dim = Config.INTENT_DIM
         self.hidden_dim = Config.HIDDEN_DIM
+        self.num_heads = getattr(Config, "NUM_ATTENTION_HEADS", 4) # Default to 4 if not in config
+        self.head_dim = self.hidden_dim // self.num_heads
         
-        # Attention Projections
-        # Query comes from Ego (just intent)
+        assert self.hidden_dim % self.num_heads == 0, \
+            f"Hidden dim {self.hidden_dim} must be divisible by num_heads {self.num_heads}"
+        
+       # Projections
+        # Query: Ego Intent -> (Batch, Heads, Head_Dim)
         self.W_query = nn.Linear(self.intent_dim, self.hidden_dim)
         
-        # Key and Value come from Neighbors (Intent + Relative Position + Relative Velocity)
+        # Key & Value: Neighbor (Intent + Rel Pos) -> (Batch, Heads, Head_Dim)
         # Input dim increases by 4 (dx, dy, dvx, dvy)
-        self.W_key = nn.Linear(self.intent_dim + 4, self.hidden_dim)
-        self.W_value = nn.Linear(self.intent_dim + 4, self.hidden_dim)
+        input_feat_dim = self.intent_dim + 4
+        self.W_key = nn.Linear(input_feat_dim, self.hidden_dim)
+        self.W_value = nn.Linear(input_feat_dim, self.hidden_dim)
         
-        # Output projection (optional, to map back to intent dim or keep as hidden)
-        # We'll map back to intent_dim to concatenate with ego z later
+        # Output projection
         self.W_out = nn.Linear(self.hidden_dim, self.intent_dim)
         
     def forward(self, ego_z, neighbor_zs, neighbor_rel_pos, mask=None):
@@ -93,131 +140,63 @@ class GraphAttention(nn.Module):
             neighbor_rel_pos: (Batch, Max_Neighbors, 4) - Relative position (dx, dy) and velocity (dvx, dvy)
             mask: (Batch, Max_Neighbors) - 1 for valid neighbor, 0 for padding/masked
             
+            Args:
+            ego_z: (B, Intent_Dim)
+            neighbor_zs: (B, N, Intent_Dim)
+            neighbor_rel_pos: (B, N, 4)
+            mask: (B, N)
         Returns:
             context: (Batch, Intent_Dim) - Aggregated neighbor info
         """
         batch_size = ego_z.size(0)
+        num_neighbors = neighbor_zs.size(1)
         
-        # 0. Prepare Neighbor Features
-        # Concatenate Intent and Position: (Batch, Max_Neighbors, Intent_Dim + 4)
+        # 0. Prepare Inputs
+        # Neighbor Features: (B, N, Intent + 4)
         neighbor_features = torch.cat([neighbor_zs, neighbor_rel_pos], dim=-1)
 
-        # 1. Projections
-        # Q: (Batch, 1, Hidden)
-        Q = self.W_query(ego_z).unsqueeze(1)
+        # 1. Projections & Reshape for Multi-Head
+        # Q: (B, Hidden) -> (B, Heads, 1, Head_Dim)
+        Q = self.W_query(ego_z).view(batch_size, self.num_heads, 1, self.head_dim)
         
-        # K, V: (Batch, Max_Neighbors, Hidden)
-        K = self.W_key(neighbor_features)
-        V = self.W_value(neighbor_features)
+        # K, V: (B, N, Hidden) -> (B, Heads, N, Head_Dim)
+        # Note: We transpose (1, 2) to put Heads dimension first
+        K = self.W_key(neighbor_features).view(batch_size, num_neighbors, self.num_heads, self.head_dim).transpose(1, 2)
+        V = self.W_value(neighbor_features).view(batch_size, num_neighbors, self.num_heads, self.head_dim).transpose(1, 2)
         
-        # 2. Attention Scores
-        # (Batch, 1, Hidden) x (Batch, Hidden, Max_Neighbors) -> (Batch, 1, Max_Neighbors)
-        scores = torch.bmm(Q, K.transpose(1, 2))
-        
-        # Scale scores
-        scores = scores / (self.hidden_dim ** 0.5)
+        # 2. Attention Scores (Scaled Dot-Product)
+        # (B, Heads, 1, Head_Dim) @ (B, Heads, Head_Dim, N) -> (B, Heads, 1, N)
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim ** 0.5)
+
+        # 2.5. Physics-Aware Inductive Bias (Distance Bias)
+        # Prioritize physically closer neighbors by subtracting a distance-based bias
+        # neighbor_rel_pos: (B, N, 4) = [dx, dy, dvx, dvy]
+        # bias: (B, N), smaller for close neighbors, larger for distant ones
+        distance_scale = getattr(Config, "DISTANCE_BIAS_SCALE", 0.5)
+        dx_dy = neighbor_rel_pos[..., :2]
+        dists = torch.sqrt(torch.clamp((dx_dy ** 2).sum(dim=-1), min=1e-12))
+        scores = scores - (distance_scale * dists).unsqueeze(1).unsqueeze(1)
         
         # 3. Masking
         if mask is not None:
-            # mask is (Batch, Max_Neighbors)
-            # unsqueeze to (Batch, 1, Max_Neighbors)
-            mask = mask.unsqueeze(1) # Fix: Ensure mask has correct dimensions for broadcasting
-            # Set scores of invalid neighbors to -inf
-            scores = scores.masked_fill(mask == 0, -1e9)
+            # mask: (B, N) -> (B, 1, 1, N) to broadcast over Heads
+            mask_expanded = mask.unsqueeze(1).unsqueeze(1)
+            # Fill -inf where mask is 0
+            scores = scores.masked_fill(mask_expanded == 0, -1e9)
             
-        # 4. Attention Weights
-        weights = F.softmax(scores, dim=-1)
+        # 4. Weights
+        weights = F.softmax(scores, dim=-1) # (B, Heads, 1, N)
         
         # 5. Weighted Sum
-        # (Batch, 1, Max_Neighbors) x (Batch, Max_Neighbors, Hidden) -> (Batch, 1, Hidden)
-        context_hidden = torch.bmm(weights, V)
+        # (B, Heads, 1, N) @ (B, Heads, N, Head_Dim) -> (B, Heads, 1, Head_Dim)
+        context_heads = torch.matmul(weights, V)
         
-        # 6. Output Projection
-        context = self.W_out(context_hidden.squeeze(1))
+        # 6. Concatenate Heads
+        # (B, Heads, 1, Head_Dim) -> (B, Hidden)
+        context_concat = context_heads.view(batch_size, self.hidden_dim)
+        
+        # 7. Output Projection
+        context = self.W_out(context_concat)
         
         return context
-
-class CooperativePolicy(nn.Module):
-    """
-    Module A: The Cooperative Policy (End-to-End).
-    Combines IntentEncoder, GraphAttention, and Actor-Critic heads.
-    """
-    def __init__(self, input_dim, action_dim):
-        super(CooperativePolicy, self).__init__()
-        self.encoder = IntentEncoder(input_dim)
-        self.fusion = GraphAttention()
-        
-        # Policy Head
-        # Input: Ego Intent (z) + Context (aggregated neighbors)
-        self.actor = nn.Sequential(
-            nn.Linear(Config.INTENT_DIM * 2, Config.HIDDEN_DIM),
-            nn.ReLU(),
-            nn.Linear(Config.HIDDEN_DIM, Config.HIDDEN_DIM),
-            nn.ReLU()
-        )
-        self.mean_head = nn.Linear(Config.HIDDEN_DIM, action_dim)
-        self.std_head = nn.Linear(Config.HIDDEN_DIM, action_dim)
-        
-        # Value Head
-        self.critic = nn.Sequential(
-            nn.Linear(Config.INTENT_DIM * 2, Config.HIDDEN_DIM),
-            nn.ReLU(),
-            nn.Linear(Config.HIDDEN_DIM, Config.HIDDEN_DIM),
-            nn.ReLU(),
-            nn.Linear(Config.HIDDEN_DIM, 1)
-        )
-        
-    def forward(self, obs_batch, action=None):
-        """
-        Args:
-            obs_batch: Dict containing tensors
-            action: Optional action tensor for training (calculating log_probs)
-        """
-        # Unpack
-        node_features = obs_batch['node_features']
-        neighbor_indices = obs_batch['neighbor_indices']
-        neighbor_mask = obs_batch['neighbor_mask']
-        neighbor_rel_pos = obs_batch['neighbor_rel_pos']
-        gt_waypoints = obs_batch.get('gt_waypoints', None)
-        
-        # 1. Encode
-        z, pred_waypoints = self.encoder(node_features)
-        
-        # 2. Gather Neighbor Intents
-        # Handle padding index -1 by clamping to 0 (mask will zero out contribution)
-        safe_indices = neighbor_indices.clamp(min=0)
-        neighbor_zs = z[safe_indices] # (Batch, Max_N, Intent_Dim)
-        
-        # 3. Fusion
-        context = self.fusion(z, neighbor_zs, neighbor_rel_pos, neighbor_mask)
-        
-        # 4. Concatenate
-        features = torch.cat([z, context], dim=1)
-        
-        # 5. Actor-Critic
-        actor_features = self.actor(features)
-        action_mean = self.mean_head(actor_features)
-        action_std = F.softplus(self.std_head(actor_features)) + 1e-5
-        
-        value = self.critic(features)
-        
-        results = {
-            "action_mean": action_mean,
-            "action_std": action_std,
-            "value": value
-        }
-        
-        # 6. Aux Loss
-        if gt_waypoints is not None:
-            recon_loss = F.mse_loss(pred_waypoints, gt_waypoints)
-            results["aux_loss"] = recon_loss
-            
-        # 7. Log Probs (for training)
-        if action is not None:
-            dist = torch.distributions.Normal(action_mean, action_std)
-            action_log_probs = dist.log_prob(action).sum(dim=-1)
-            dist_entropy = dist.entropy().sum(dim=-1)
-            results["action_log_probs"] = action_log_probs
-            results["dist_entropy"] = dist_entropy
-            
-        return results
+    

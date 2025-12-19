@@ -1,4 +1,8 @@
-import os
+import os, sys
+os.environ["TORCHDYNAMO_DISABLE"] = "1"          # 彻底关闭 TorchDynamo
+# 可选：让 Dynamo 出错后自动回退到 eager，双保险
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
 import sys
 import shutil
 import argparse
@@ -7,19 +11,84 @@ import subprocess
 import time
 from collections import defaultdict, deque
 
-# Add the project root directory to sys.path to allow imports from marl_project
+# Ensure project root is importable when running from repo root
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import multiprocessing as mp
+mp.set_start_method("spawn", force=True)
 import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
-from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor, VecNormalize
 from marl_project.config import Config
 from marl_project.env_wrapper import GraphEnvWrapper
 from marl_project.models.policy import CooperativePolicy
+from marl_project.mp_env import MultiProcEnv
+
+
+_MAX_TTC_PENALTY_SCALE = float(getattr(Config, "TTC_PENALTY_SCALE", 0.0))
+_MAX_ACTION_MAG_PENALTY = float(getattr(Config, "ACTION_MAG_PENALTY", 0.0))
+_MAX_ACTION_CHANGE_PENALTY = float(getattr(Config, "ACTION_CHANGE_PENALTY", 0.0))
+
+
+def update_curriculum(current_step: int, total_steps: int):
+    """Curriculum learning schedule.
+
+    Phase 1 (0-20%): disable TTC + comfort penalties.
+    Phase 2 (20-60%): linearly ramp TTC penalty to max.
+    Phase 3 (60-100%): enable comfort penalties.
+    """
+    if total_steps <= 0:
+        progress = 1.0
+    else:
+        progress = float(current_step) / float(total_steps)
+    progress = max(0.0, min(1.0, progress))
+
+    if progress < 0.2:
+        Config.TTC_PENALTY_SCALE = 0.0
+        Config.ACTION_MAG_PENALTY = 0.0
+        Config.ACTION_CHANGE_PENALTY = 0.0
+        return
+
+    if progress < 0.6:
+        t = (progress - 0.2) / 0.4
+        Config.TTC_PENALTY_SCALE = float(t) * _MAX_TTC_PENALTY_SCALE
+        Config.ACTION_MAG_PENALTY = 0.0
+        Config.ACTION_CHANGE_PENALTY = 0.0
+        return
+
+    # Phase 3
+    Config.TTC_PENALTY_SCALE = _MAX_TTC_PENALTY_SCALE
+    Config.ACTION_MAG_PENALTY = _MAX_ACTION_MAG_PENALTY
+    Config.ACTION_CHANGE_PENALTY = _MAX_ACTION_CHANGE_PENALTY
+
+
+def _vec_to_list(x, num_envs: int):
+    if isinstance(x, list) or isinstance(x, tuple):
+        return list(x)
+    if isinstance(x, np.ndarray):
+        # 如果是 object 类型的数组（通常是多智能体环境的返回），直接转 list
+        return list(x)
+    # 兼容性修改：如果 SB3 返回了未堆叠的 Dict (在某些 DummyVecEnv 版本下可能发生)
+    # 我们假设它已经是我们要的格式，或者尝试拆分
+    if isinstance(x, dict):
+        # 只有当它是堆叠后的 Dict (key -> array of envs) 时才需要拆分
+        # 但多智能体 MARL 通常是 list of dicts。
+        # 这里做一个简单的处理：如果它看起来像堆叠数据，尝试拆开；否则直接报错
+        sample_val = next(iter(x.values()))
+        if isinstance(sample_val, (np.ndarray, list)) and len(sample_val) == num_envs:
+             # 这是一个 Stacked Dict，我们需要把它转回 List of Dicts
+             # (虽然你的环境因为 Key 动态变化，SB3 应该不会走到这一步，但以防万一)
+             return [{k: v[i] for k, v in x.items()} for i in range(num_envs)]
+        else:
+             # 也许它就是单个环境的 Dict？(num_envs=1)
+             if num_envs == 1:
+                 return [x]
+             
+    # Fallback
+    return [x for _ in range(int(num_envs))]
 
 def parse_args():
     parser = argparse.ArgumentParser(description="PPO Training for MARL")
@@ -28,12 +97,33 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=Config.BATCH_SIZE, help="Batch size")
     parser.add_argument("--ppo_epochs", type=int, default=Config.PPO_EPOCHS, help="PPO epochs")
     parser.add_argument("--aux_loss_coef", type=float, default=Config.AUX_LOSS_COEF, help="Aux loss coefficient")
-    parser.add_argument("--map_type", type=str, default=Config.MAP_TYPE, help="Map type (S, C, X)")
+    # Map switching
+    parser.add_argument(
+        "--map_mode",
+        type=str,
+        default=getattr(Config, "MAP_MODE", "block_num"),
+        choices=["block_num", "block_sequence"],
+        help='Map mode: "block_num" or "block_sequence"',
+    )
+    parser.add_argument(
+        "--map_block_num",
+        type=int,
+        default=getattr(Config, "MAP_BLOCK_NUM", 3),
+        help="Number of blocks when map_mode=block_num",
+    )
+    parser.add_argument(
+        "--map_type",
+        type=str,
+        default=Config.MAP_TYPE,
+        help='Block sequence string when map_mode=block_sequence (e.g., "SSSSS", "X", "r")',
+    )
     
     # New args
     parser.add_argument("--aux_decay", type=int, default=1, help="Decay aux loss coef (1=True, 0=False)")
     parser.add_argument("--clip_eps", type=float, default=Config.CLIP_EPSILON, help="PPO clip epsilon")
     parser.add_argument("--grad_norm", type=float, default=Config.MAX_GRAD_NORM, help="Max gradient norm")
+    parser.add_argument("--entropy_coef", type=float, default=Config.ENTROPY_COEF, help="Entropy coefficient for exploration")
+    parser.add_argument("--vf_coef", type=float, default=getattr(Config, "VF_COEF", 0.5), help="Value loss coefficient")
     parser.add_argument("--device", type=str, default="cuda:0", help="Device to use (cpu/cuda)")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     parser.add_argument("--max_time", type=int, default=30, help="Max wall-clock seconds to train before stopping")
@@ -48,23 +138,78 @@ def update_config(args):
             print(f"Config updated: {key_upper} = {value}")
 
 def calculate_gae(rewards, dones, values, next_value, gamma, gae_lambda):
-    """
-    Calculate GAE for a single agent's trajectory.
-    """
+    """Calculate GAE for a single agent's trajectory."""
+
     advantages = []
-    gae = 0
-    
-    # Ensure inputs are tensors or numpy arrays
-    # We assume they are tensors on the correct device
-    
+    gae = 0.0
+
     for i in reversed(range(len(rewards))):
         mask = 1.0 - dones[i]
         delta = rewards[i] + gamma * next_value * mask - values[i]
         gae = delta + gamma * gae_lambda * mask * gae
         advantages.insert(0, gae)
         next_value = values[i]
-        
-    return torch.tensor(advantages, dtype=torch.float32, device=rewards.device)
+
+    return torch.stack(advantages)
+
+
+def _reset_with_seed(env, seed: int):
+    """Reset env with a given seed.
+
+    NOTE: In MetaDrive, reset(seed=...) expects a *scenario index* that must lie in
+    [env.start_index, env.start_index + env.num_scenarios). It is NOT an arbitrary RNG seed.
+    This helper maps the provided seed into the valid scenario range when possible.
+    """
+    start_index = getattr(env, "start_index", None)
+    num_scenarios = getattr(env, "num_scenarios", None)
+
+    # Map to valid scenario index if we can
+    scenario_index = seed
+    if isinstance(start_index, int) and isinstance(num_scenarios, int) and num_scenarios > 0:
+        scenario_index = int(start_index + ((seed - start_index) % num_scenarios))
+
+    try:
+        return env.reset(seed=scenario_index)
+    except (TypeError, AssertionError):
+        # Fallback for older APIs
+        try:
+            env.seed(seed)
+        except Exception:
+            pass
+        return env.reset()
+
+
+def make_env(rank: int, seed: int):
+    """Factory for creating an environment.
+
+    IMPORTANT (Windows spawn): do NOT return a local closure here, because it is not pickleable.
+    We return a top-level callable object instead.
+    """
+    return _EnvFactory(rank=rank, seed=seed)
+
+
+class _EnvFactory:
+    """Pickle-friendly env factory for multiprocessing spawn."""
+
+    def __init__(self, rank: int, seed: int):
+        self.rank = int(rank)
+        self.seed = int(seed)
+
+    def __call__(self):
+        # Import inside to avoid pickling issues and heavy imports in parent.
+        from marl_project.config import Config
+        from marl_project.env_wrapper import GraphEnvWrapper
+
+        env_cfg = Config.get_metadrive_config()
+        env_cfg["start_seed"] = self.seed + self.rank
+        env_cfg["num_scenarios"] = int(getattr(Config, "TRAIN_NUM_SCENARIOS", 10000))
+        env_cfg["use_render"] = False
+        env = GraphEnvWrapper(config=env_cfg)
+        try:
+            env.seed(self.seed + self.rank)
+        except Exception:
+            pass
+        return env
 
 def train():
     # --- Setup ---
@@ -74,8 +219,8 @@ def train():
     
     args = parse_args()
     update_config(args)
-    
-    log_dir = "logs/marl_experiment"
+
+    log_dir = "logs/marl_experiment/cornering"
     os.makedirs(log_dir, exist_ok=True)
     
     # Save config for reproducibility
@@ -94,40 +239,68 @@ def train():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print(f"Training on device: {device}")
 
-    # --- SubprocVecEnv with per-worker logs ---
-    def make_env(rank):
-        def _thunk():
-            os.makedirs("logs", exist_ok=True)
-            sys.stdout = open(os.path.join("logs", f"env_{rank}.log"), "w", buffering=1)
-            sys.stderr = sys.stdout
-            env_inst = GraphEnvWrapper()
-            env_inst.seed(42 + rank)
-            return env_inst
-        return _thunk
+    # --- Parallel envs (方案3: 自定义多进程采样器) ---
+    num_envs = int(getattr(Config, "NUM_ENVS", 1))
+    base_seed = int(getattr(Config, "BASE_SEED", 5000))
+    env_fns = [make_env(i, base_seed) for i in range(num_envs)]
 
-    vec_env = SubprocVecEnv([make_env(i) for i in range(Config.NUM_ENVS)], start_method="spawn")
-    vec_env = VecMonitor(vec_env)
-    vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=False, clip_obs=10.0)
+    print(f"Using MultiProcEnv with {num_envs} workers (spawn)")
+    envs = MultiProcEnv(env_fns)
+
+    # Prepare a template action space for clipping (best-effort)
+    env_space = getattr(envs, "action_space", None)
+    template_space = None
+    if hasattr(env_space, "spaces") and len(getattr(env_space, "spaces", {})) > 0:
+        for key in env_space.spaces:
+            candidate = env_space.spaces[key]
+            if hasattr(candidate, "low") and hasattr(candidate, "high"):
+                template_space = candidate
+                break
+            if hasattr(candidate, "spaces"):
+                for sub_key in candidate.spaces:
+                    sub = candidate.spaces[sub_key]
+                    if hasattr(sub, "low") and hasattr(sub, "high"):
+                        template_space = sub
+                        break
+                if template_space is not None:
+                    break
+    elif hasattr(env_space, "low") and hasattr(env_space, "high"):
+        template_space = env_space
+
+    def clip_action(act: np.ndarray):
+        if template_space is None:
+            return act
+        return np.clip(act, template_space.low, template_space.high)
 
     # Get dimensions from a dummy reset
-    obs_list = vec_env.reset()
-    obs_dict = obs_list[0] if isinstance(obs_list, (list, tuple)) else obs_list
-    sample_agent = list(obs_dict.keys())[0]
-    input_dim = obs_dict[sample_agent]['node_features'].shape[0]
-    action_dim = vec_env.action_space[sample_agent].shape[0]
+    obs0_list = envs.reset(seeds=[base_seed + i for i in range(num_envs)])
+    first_obs = obs0_list[0]
+    sample_agent = list(first_obs.keys())[0]
+    input_dim = first_obs[sample_agent]['node_features'].shape[0]
+    # best-effort: infer from env_space (may be Dict)
+    action_dim = None
+    if hasattr(env_space, "spaces") and sample_agent in getattr(env_space, "spaces", {}):
+        action_dim = env_space.spaces[sample_agent].shape[0]
+    elif template_space is not None and hasattr(template_space, "shape"):
+        action_dim = int(template_space.shape[0])
+    else:
+        # Fallback to 2-dim continuous actions (steer, throttle/brake) if not inferable
+        action_dim = 2
 
-    policy = torch.compile(CooperativePolicy(input_dim, action_dim).to(device), mode="reduce-overhead")
+    policy = CooperativePolicy(input_dim, action_dim).to(device)
     optimizer = optim.Adam(policy.parameters(), lr=Config.LR)
     
     print(f"Initialized Policy. Input: {input_dim}, Action: {action_dim}")
     
     # --- Training Parameters ---
-    num_updates = 1000
+    num_updates = 3500
     steps_per_update = Config.N_STEPS
     gamma = Config.GAMMA
     gae_lambda = 0.95
     clip_epsilon = args.clip_eps
     max_grad_norm = args.grad_norm
+    entropy_coef = args.entropy_coef
+    vf_coef = args.vf_coef
     
     # Checkpointing
     best_reward = -float('inf')
@@ -140,8 +313,24 @@ def train():
     if args.resume:
         if os.path.exists(args.resume):
             print(f"Resuming from checkpoint: {args.resume}")
-            state_dict = torch.load(args.resume, map_location=device)
-            policy.load_state_dict(state_dict)
+            # Use weights_only to avoid pickle execution (PyTorch future default)
+            state_dict = torch.load(args.resume, map_location=device, weights_only=True)
+
+            # Drop aux_head if shape mismatches (e.g., PRED_WAYPOINTS_NUM changed)
+            def _filter_mismatched(sd, model):
+                filtered = {}
+                model_sd = model.state_dict()
+                for k, v in sd.items():
+                    if k in model_sd and model_sd[k].shape != v.shape:
+                        print(f"[Resume] Drop mismatched key {k}: ckpt {tuple(v.shape)} vs model {tuple(model_sd[k].shape)}")
+                        continue
+                    filtered[k] = v
+                return filtered
+
+            state_dict = _filter_mismatched(state_dict, policy)
+            missing, unexpected = policy.load_state_dict(state_dict, strict=False)
+            if missing or unexpected:
+                print(f"[Resume] Loaded with relaxed strictness. Missing: {missing}, Unexpected: {unexpected}")
             
             # Try to parse update number from filename
             import re
@@ -158,25 +347,48 @@ def train():
         if args.max_time and (time.time() - wall_start) >= args.max_time:
             print("Max wall-clock time reached, stopping.")
             break
+
+        # Curriculum learning update (based on training progress)
+        update_curriculum(current_step=update - 1, total_steps=num_updates)
+        
+        # === 同步 Curriculum 参数到所有 worker ===
+        curriculum_params = {
+            "TTC_PENALTY_SCALE": Config.TTC_PENALTY_SCALE,
+            "ACTION_MAG_PENALTY": Config.ACTION_MAG_PENALTY,
+            "ACTION_CHANGE_PENALTY": Config.ACTION_CHANGE_PENALTY
+        }
+        envs.env_method("update_config_params", curriculum_params)
+        # ==========================================
+        
         # --- 1. Rollout Phase ---
         buffer = {
             "obs": [],
             "actions": [],
             "rewards": [],
             "dones": [],
-            "agent_ids": [],   # <--- ADDED THIS explicitly
-            "old_values": [],      # <--- Stored detached tensors
-            "old_logprobs": [],    # <--- Stored detached tensors
-            "aux_preds": [],       # <--- Stored detached tensors
+            "agent_ids": [],
+            "old_values": [],
+            "old_logprobs": [],
+            "aux_preds": [],
             "gt_waypoints": []
         }
         
         # Reward Tracking
         completed_episode_rewards = []
         episode_rewards = {}
+        reward_components = defaultdict(float)
+        reward_steps = 0
+        event_counts = defaultdict(int)
+        risk_stats = defaultdict(float)
         
-        obs_list = vec_env.reset()
+        # Parallel reset: keep list[dict] obs for existing rollout logic
+        # diversify scenario indices deterministically within each worker's scenario range
+        num_scenarios = int(getattr(Config, "TRAIN_NUM_SCENARIOS", 10000))
+        reset_seeds = [int(base_seed + i + ((update - 1) % max(1, num_scenarios))) for i in range(num_envs)]
+        obs_list = envs.reset(seeds=reset_seeds)
         episode_rewards = [{a_id: 0.0 for a_id in obs} for obs in obs_list]
+        # Track previous actions per env for smoothing
+        prev_actions = [dict() for _ in range(num_envs)]
         
         for step in range(steps_per_update):
             global_step += 1
@@ -225,14 +437,18 @@ def train():
                     batch_neighbor_indices.append(n_indices)
                     batch_neighbor_mask.append(n_mask)
                     batch_neighbor_rel_pos.append(n_rel_pos)
+
+            # If no active agents (e.g., all done), skip this step safely
+            if len(batch_node_features) == 0:
+                continue
             
             # Convert to Tensor and move to device
             obs_tensor_batch = {
-                "node_features": torch.tensor(np.array(batch_node_features), dtype=torch.float32, pin_memory=True),
-                "neighbor_indices": torch.tensor(np.array(batch_neighbor_indices), dtype=torch.long, pin_memory=True),
-                "neighbor_mask": torch.tensor(np.array(batch_neighbor_mask), dtype=torch.float32, pin_memory=True),
-                "neighbor_rel_pos": torch.tensor(np.array(batch_neighbor_rel_pos), dtype=torch.float32, pin_memory=True),
-                "gt_waypoints": torch.tensor(np.array(batch_gt_waypoints), dtype=torch.float32, pin_memory=True)
+                "node_features": torch.tensor(np.array(batch_node_features), dtype=torch.float32),
+                "neighbor_indices": torch.tensor(np.array(batch_neighbor_indices), dtype=torch.long),
+                "neighbor_mask": torch.tensor(np.array(batch_neighbor_mask), dtype=torch.float32),
+                "neighbor_rel_pos": torch.tensor(np.array(batch_neighbor_rel_pos), dtype=torch.float32),
+                "gt_waypoints": torch.tensor(np.array(batch_gt_waypoints), dtype=torch.float32)
             }
             
             # Inference (using forward_actor_critic for no_grad)
@@ -252,21 +468,94 @@ def train():
             cursor = 0
             for env_idx, obs_dict in enumerate(obs_list):
                 count = env_agent_counts[env_idx]
-                env_actions.append({aid: actions[cursor + j].cpu().numpy() for j, aid in enumerate(obs_dict.keys())})
+                env_action_dict = {}
+                for j, aid in enumerate(obs_dict.keys()):
+                    raw_act = actions[cursor + j].cpu().numpy()
+                    prev = prev_actions[env_idx].get(aid)
+                    if prev is not None:
+                        smoothed = Config.ACTION_SMOOTH_ALPHA * prev + (1 - Config.ACTION_SMOOTH_ALPHA) * raw_act
+                    else:
+                        smoothed = raw_act
+                    smoothed = clip_action(smoothed)
+                    env_action_dict[aid] = smoothed
+                    prev_actions[env_idx][aid] = smoothed
+                env_actions.append(env_action_dict)
                 cursor += count
 
-            next_obs_list, rewards_list, dones_list, infos_list = vec_env.step(env_actions)
+            # Parallel step
+            next_obs_list, rewards_list, dones_list, infos_list = envs.step(env_actions)
+
+            # Clear history for terminated agents to avoid stale smoothing
+            for env_idx in range(num_envs):
+                n_dones = dones_list[env_idx]
+                if isinstance(n_dones, dict):
+                    for aid, done_flag in n_dones.items():
+                        if done_flag:
+                            prev_actions[env_idx].pop(aid, None)
             
             # Track Rewards
             for env_idx, obs_dict in enumerate(obs_list):
                 rewards = rewards_list[env_idx]
                 dones = dones_list[env_idx]
+                infos = infos_list[env_idx]
                 for a_id in obs_dict.keys():
                     key = f"{env_idx}:{a_id}"
                     episode_rewards[env_idx][key] = episode_rewards[env_idx].get(key, 0.0) + rewards.get(a_id, 0.0)
                     if dones.get(a_id, False):
                         completed_episode_rewards.append(episode_rewards[env_idx][key])
                         episode_rewards[env_idx][key] = 0.0
+
+                    info = infos.get(a_id, {}) if isinstance(infos, dict) else {}
+                    breakdown = info.get("reward_breakdown") if isinstance(info, dict) else None
+                    if breakdown:
+                        for k, v in breakdown.items():
+                            try:
+                                reward_components[k] += float(v)
+                            except Exception:
+                                continue
+                        reward_steps += 1
+
+                    # Per-step risk stats (min_ttc/min_dist/idle_count)
+                    risk_stats["step_agents"] += 1.0
+                    min_ttc = info.get("min_ttc_s")
+                    if min_ttc is not None:
+                        risk_stats["steps_with_ttc"] += 1.0
+                        risk_stats["min_ttc_sum"] += float(min_ttc)
+                        ttc_thr = float(getattr(Config, "TTC_THRESHOLD_S", 2.5))
+                        if float(min_ttc) < ttc_thr:
+                            risk_stats["risk_ttc_steps"] += 1.0
+                    min_dist = info.get("min_neighbor_dist")
+                    if min_dist is not None:
+                        risk_stats["steps_with_dist"] += 1.0
+                        risk_stats["min_dist_sum"] += float(min_dist)
+                        safety_dist = float(getattr(Config, "SAFETY_DIST", 8.0))
+                        if float(min_dist) < safety_dist:
+                            risk_stats["risk_dist_steps"] += 1.0
+                    idle_count = info.get("idle_count")
+                    if idle_count is not None:
+                        risk_stats["idle_count_sum"] += float(idle_count)
+                        risk_stats["idle_count_n"] += 1.0
+
+                    # Terminal event proportions (count only when done)
+                    if dones.get(a_id, False):
+                        event_counts["terminal_total"] += 1
+                        term = info.get("terminal_reason")
+                        if term is None:
+                            # Fallback if wrapper is not used
+                            if info.get("arrive_dest", False):
+                                term = "success"
+                            elif info.get("crash", False):
+                                term = "crash"
+                            elif info.get("out_of_road", False):
+                                term = "out_of_road"
+                            elif info.get("truncated", False):
+                                term = "timeout"
+                            else:
+                                term = "other"
+                        event_counts[term] += 1
+                        ev = info.get("event", {})
+                        if isinstance(ev, dict) and ev.get("idle_long", False):
+                            event_counts["idle_long"] += 1
 
             # Store in buffer
             buffer["obs"].append({k: v.cpu() for k, v in obs_tensor_batch.items()})
@@ -316,8 +605,8 @@ def train():
             
         # Calculate Advantages per agent trajectory
         # Initialize flat_advantages and flat_returns with zeros
-        flat_advantages = torch.zeros_like(flat_rewards).to(device)
-        flat_returns = torch.zeros_like(flat_rewards).to(device)
+        flat_advantages = torch.zeros_like(flat_rewards)
+        flat_returns = torch.zeros_like(flat_rewards)
         
         for agent_id, indices in agent_indices.items():
             # Slice data for this agent
@@ -352,6 +641,7 @@ def train():
             "neighbor_indices": torch.cat([step_obs["neighbor_indices"] for step_obs in buffer["obs"]]),
             "neighbor_mask": torch.cat([step_obs["neighbor_mask"] for step_obs in buffer["obs"]]),
             "neighbor_rel_pos": torch.cat([step_obs["neighbor_rel_pos"] for step_obs in buffer["obs"]]),
+            "gt_waypoints": torch.cat(buffer["gt_waypoints"]),
         }
         
         # Aux Loss Scheduler
@@ -363,13 +653,16 @@ def train():
         total_ppo_loss = 0
         total_value_loss = 0
         total_aux_loss = 0
+        total_entropy = 0
         total_loss = 0
+        num_minibatches = 0
         
         dataset = TensorDataset(
             flat_obs["node_features"].pin_memory(),
             flat_obs["neighbor_indices"].pin_memory(),
             flat_obs["neighbor_mask"].pin_memory(),
             flat_obs["neighbor_rel_pos"].pin_memory(),
+            flat_obs["gt_waypoints"].pin_memory(),
             flat_actions.pin_memory(),
             flat_old_logprobs.pin_memory(),
             flat_old_values.pin_memory(),
@@ -379,13 +672,14 @@ def train():
         loader = DataLoader(dataset, batch_size=Config.BATCH_SIZE, shuffle=True, drop_last=True, pin_memory=True)
 
         for _ in range(Config.PPO_EPOCHS):
-            for (b_nodes, b_nidx, b_nmask, b_nrel, b_actions, b_old_logprobs,
+            for (b_nodes, b_nidx, b_nmask, b_nrel, b_gtw, b_actions, b_old_logprobs,
                  b_old_values, b_returns, b_advantages) in loader:
                 obs_batch = {
                     "node_features": b_nodes.to(device, non_blocking=True),
                     "neighbor_indices": b_nidx.to(device, non_blocking=True),
                     "neighbor_mask": b_nmask.to(device, non_blocking=True),
                     "neighbor_rel_pos": b_nrel.to(device, non_blocking=True),
+                    "gt_waypoints": b_gtw.to(device, non_blocking=True),
                 }
 
                 results = policy(obs_batch, action=b_actions.to(device, non_blocking=True))
@@ -406,8 +700,8 @@ def train():
                 v_loss_clipped = (v_clipped - b_returns_gpu) ** 2
                 value_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
 
-                entropy_loss = -dist_entropy.mean() * 0.01
-                step_loss = ppo_loss + value_loss + entropy_loss + current_aux_coef * aux_loss
+                entropy_loss = -dist_entropy.mean() * entropy_coef
+                step_loss = ppo_loss + vf_coef * value_loss + entropy_loss + current_aux_coef * aux_loss
 
                 optimizer.zero_grad()
                 step_loss.backward()
@@ -417,31 +711,66 @@ def train():
                 total_ppo_loss += ppo_loss.item()
                 total_value_loss += value_loss.item()
                 total_aux_loss += aux_loss.item()
+                total_entropy += dist_entropy.mean().item()
                 total_loss += step_loss.item()
+                num_minibatches += 1
             
         # --- Logging ---
-        avg_divisor = max(1, steps_per_update * Config.PPO_EPOCHS)
-        avg_loss = total_loss / avg_divisor
+            avg_divisor = max(1, num_minibatches)
+            avg_loss = total_loss / avg_divisor
         
         mean_step_reward = flat_rewards.mean().item()
         writer.add_scalar("Reward/Mean_Step", mean_step_reward, global_step)
+        denom = max(1, reward_steps)
+        writer.add_scalar("RewardDecomp/CrashPenalty_per_step", reward_components.get("crash_penalty", 0.0) / denom, global_step)
+        writer.add_scalar("RewardDecomp/SafetyPenalty_per_step", reward_components.get("safety_penalty", 0.0) / denom, global_step)
+        writer.add_scalar("RewardDecomp/Total_per_step", reward_components.get("total", 0.0) / denom, global_step)
+
+        # Terminal proportions (per-update)
+        term_denom = max(1, int(event_counts.get("terminal_total", 0)))
+        writer.add_scalar("Terminal/SuccessRate", float(event_counts.get("success", 0)) / term_denom, global_step)
+        writer.add_scalar("Terminal/CrashRate", float(event_counts.get("crash", 0)) / term_denom, global_step)
+        writer.add_scalar("Terminal/OutOfRoadRate", float(event_counts.get("out_of_road", 0)) / term_denom, global_step)
+        writer.add_scalar("Terminal/TimeoutRate", float(event_counts.get("timeout", 0)) / term_denom, global_step)
+        writer.add_scalar("Terminal/OtherRate", float(event_counts.get("other", 0)) / term_denom, global_step)
+        writer.add_scalar("Terminal/IdleLongRate", float(event_counts.get("idle_long", 0)) / term_denom, global_step)
+
+        # Keep legacy event counters for quick glance (now terminal counts)
+        writer.add_scalar("Events/Crash", event_counts.get("crash", 0), global_step)
+        writer.add_scalar("Events/OutOfRoad", event_counts.get("out_of_road", 0), global_step)
+
+        # Risk stats (per-step)
+        steps_with_ttc = max(1.0, risk_stats.get("steps_with_ttc", 0.0))
+        steps_with_dist = max(1.0, risk_stats.get("steps_with_dist", 0.0))
+        writer.add_scalar("Risk/FracSteps_TTC_Threat", float(risk_stats.get("risk_ttc_steps", 0.0)) / steps_with_ttc, global_step)
+        writer.add_scalar("Risk/FracSteps_Dist_Threat", float(risk_stats.get("risk_dist_steps", 0.0)) / steps_with_dist, global_step)
+        writer.add_scalar("Risk/MeanMinTTC", float(risk_stats.get("min_ttc_sum", 0.0)) / steps_with_ttc, global_step)
+        writer.add_scalar("Risk/MeanMinDist", float(risk_stats.get("min_dist_sum", 0.0)) / steps_with_dist, global_step)
+        idle_n = max(1.0, risk_stats.get("idle_count_n", 0.0))
+        writer.add_scalar("Deadlock/MeanIdleCount", float(risk_stats.get("idle_count_sum", 0.0)) / idle_n, global_step)
         
         mean_ep_reward = 0.0
         if len(completed_episode_rewards) > 0:
             mean_ep_reward = np.mean(completed_episode_rewards)
             writer.add_scalar("Reward/Mean_Episode", mean_ep_reward, global_step)
-            
         elapsed = max(1e-8, time.time() - wall_start)
         steps_per_sec = global_step / elapsed
         try:
             gpu_util = subprocess.check_output(["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"]).decode().strip().split("\n")[0]
         except Exception:
             gpu_util = "NA"
-        print(f"Update {update}/{num_updates} | Loss: {avg_loss:.4f} | Aux: {total_aux_loss/avg_divisor:.4f} | EpReward: {mean_ep_reward:.2f} | SPS: {steps_per_sec:.2f} | GPU%: {gpu_util}")
+        print(
+            f"Update {update}/{num_updates} | Loss: {avg_loss:.4f} | "
+            f"PPO: {total_ppo_loss/avg_divisor:.4f} | V: {total_value_loss/avg_divisor:.4f} | "
+            f"Ent: {total_entropy/avg_divisor:.4f} | Aux: {total_aux_loss/avg_divisor:.4f} | "
+            f"EpReward: {mean_ep_reward:.2f} | SPS: {steps_per_sec:.2f} | GPU%: {gpu_util}"
+        )
         
         writer.add_scalar("Loss/Total", avg_loss, global_step)
         writer.add_scalar("Loss/Aux", total_aux_loss/avg_divisor, global_step)
         writer.add_scalar("Loss/PPO", total_ppo_loss/avg_divisor, global_step)
+        writer.add_scalar("Loss/Value", total_value_loss/avg_divisor, global_step)
+        writer.add_scalar("Loss/Entropy", total_entropy/avg_divisor, global_step)
         
         # --- Save ---
         # Save Best Model
@@ -457,7 +786,10 @@ def train():
             saved_checkpoints.append(ckpt_path)
             print(f"Model saved at update {update}")
 
-    env.close()
+    try:
+        envs.close()
+    except Exception:
+        pass
     writer.close()
 
 if __name__ == "__main__":

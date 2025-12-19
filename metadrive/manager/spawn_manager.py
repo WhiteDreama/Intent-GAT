@@ -11,10 +11,13 @@ from metadrive.component.vehicle.base_vehicle import BaseVehicle
 from metadrive.constants import MetaDriveType
 from metadrive.constants import CollisionGroup
 from metadrive.engine.engine_utils import get_engine
+from metadrive.engine.logger import get_logger
 from metadrive.manager.base_manager import BaseManager
 from metadrive.utils import Config
 from metadrive.utils.coordinates_shift import panda_vector, panda_heading
 from metadrive.utils.pg.utils import rect_region_detection
+
+logger = get_logger()
 
 
 class SpawnManager(BaseManager):
@@ -25,7 +28,7 @@ class SpawnManager(BaseManager):
     PRIORITY = 1
 
     REGION_DETECT_HEIGHT = 10
-    RESPAWN_REGION_LONGITUDE = 8.
+    RESPAWN_REGION_LONGITUDE = 14.  # enlarge spawn spacing to reduce immediate collisions near spawn
     RESPAWN_REGION_LATERAL = 3.
     MAX_VEHICLE_LENGTH = BaseVehicle.MAX_LENGTH
     MAX_VEHICLE_WIDTH = BaseVehicle.MAX_WIDTH
@@ -54,10 +57,18 @@ class SpawnManager(BaseManager):
         self._init_agent_configs = agent_configs
 
         spawn_roads = self.engine.global_config["spawn_roads"]
-        agent_configs, safe_spawn_places = self._auto_fill_spawn_roads_randomly(spawn_roads)
-        self.available_agent_configs = agent_configs
-        self.safe_spawn_places = {place["identifier"]: place for place in safe_spawn_places}
-        self.spawn_roads = spawn_roads
+        # Defer auto-fill until map is ready; mark a flag here
+        self._defer_auto_fill_spawn_roads = (not spawn_roads or spawn_roads == "all")
+        if self._defer_auto_fill_spawn_roads:
+            # placeholders; will be populated in reset when map is available
+            self.spawn_roads = []
+            self.available_agent_configs = []
+            self.safe_spawn_places = {}
+        else:
+            agent_configs, safe_spawn_places = self._auto_fill_spawn_roads_randomly(spawn_roads)
+            self.available_agent_configs = agent_configs
+            self.safe_spawn_places = {place["identifier"]: place for place in safe_spawn_places}
+            self.spawn_roads = spawn_roads
         self.need_update_spawn_places = True
 
     @staticmethod
@@ -71,15 +82,35 @@ class SpawnManager(BaseManager):
 
     def reset(self):
         # random assign spawn points
+        # Always recompute spawn config per reset to match regenerated maps/seeds
+        spawn_roads_cfg = self.engine.global_config["spawn_roads"]
+        if hasattr(self.engine.current_map, "get_respawn_roads") and (not spawn_roads_cfg or spawn_roads_cfg == "all"):
+            spawn_roads = self.engine.current_map.get_respawn_roads()
+        else:
+            # Fallback: aggregate respawn roads from blocks (support list or dict)
+            spawn_roads = []
+            if hasattr(self.engine.current_map, "blocks"):
+                blocks = self.engine.current_map.blocks
+                blocks_iter = blocks.values() if isinstance(blocks, dict) else blocks
+                for blk in blocks_iter:
+                    if hasattr(blk, "get_respawn_roads"):
+                        spawn_roads.extend(blk.get_respawn_roads())
+
+        agent_configs, safe_spawn_places = self._auto_fill_spawn_roads_randomly(spawn_roads)
+        self.available_agent_configs = agent_configs
+        self.safe_spawn_places = {place["identifier"]: place for place in safe_spawn_places}
+        self.spawn_roads = spawn_roads
+        self._defer_auto_fill_spawn_roads = False
+
         num_agents = self.num_agents if self.num_agents is not None else len(self.available_agent_configs)
         assert len(self.available_agent_configs) > 0
 
         if num_agents == -1:  # Infinite number of agents
             target_agents = list(range(len(self.available_agent_configs)))
         else:
-            target_agents = self.np_random.choice(
-                [i for i in range(len(self.available_agent_configs))], num_agents, replace=False
-            )
+            population = len(self.available_agent_configs)
+            replace = num_agents > population
+            target_agents = self.np_random.choice([i for i in range(population)], num_agents, replace=replace)
 
         # set the spawn road
         ret = {}
@@ -122,24 +153,52 @@ class SpawnManager(BaseManager):
         self._longitude_spawn_interval = interval
         if self.num_agents is not None:
             assert self.num_agents > 0 or self.num_agents == -1
-            assert self.num_agents <= self.max_capacity(
-                spawn_roads, self.exit_length + FirstPGBlock.ENTRANCE_LENGTH, self.lane_num
-            ), (
-                "Too many agents! We only accept {} agents, but you have {} agents!".format(
-                    self.lane_num * len(spawn_roads) * num_slots, self.num_agents
+            if self.num_agents != -1:
+                max_cap = self.max_capacity(
+                    spawn_roads, self.exit_length + FirstPGBlock.ENTRANCE_LENGTH, self.lane_num
                 )
-            )
+                if self.num_agents > max_cap:
+                    logger.warning(
+                        "Too many agents for available spawn slots (max_capacity=%s, num_agents=%s, "
+                        "lane_num=%s, spawn_roads=%s, num_slots=%s). Will allow sampling spawn slots with replacement.",
+                        max_cap,
+                        self.num_agents,
+                        self.lane_num,
+                        len(spawn_roads),
+                        num_slots,
+                    )
 
         # We can spawn agents in the middle of road at the initial time, but when some vehicles need to be respawn,
         # then we have to set it to the farthest places to ensure safety (otherwise the new vehicles may suddenly
         # appear at the middle of the road!)
         agent_configs = []
         safe_spawn_places = []
+        rn = self.engine.current_map.road_network
         for i, road in enumerate(spawn_roads):
-            for lane_idx in range(self.lane_num):
+            try:
+                lanes = road.get_lanes(rn)
+                lane_count = len(lanes)
+            except Exception:
+                lanes = None
+                lane_count = self.lane_num
+            lane_count = max(1, lane_count)
+
+            # Skip roads not present in graph
+            if road.start_node not in rn.graph or road.end_node not in rn.graph[road.start_node]:
+                continue
+
+            for lane_idx in range(lane_count):
+                # Skip invalid lane index vs graph
+                if lane_idx >= len(rn.graph[road.start_node][road.end_node]):
+                    continue
                 for j in range(num_slots):
                     long = 1 / 2 * self.RESPAWN_REGION_LONGITUDE + j * self.RESPAWN_REGION_LONGITUDE
-                    lane_tuple = road.lane_index(lane_idx)  # like (>>>, 1C0_0_, 1) and so on.
+                    lane_tuple = road.lane_index(lane_idx)
+                    # Validate lane exists in road network; skip if not
+                    try:
+                        _ = rn.get_lane(lane_tuple)
+                    except Exception:
+                        continue
                     agent_configs.append(
                         Config(
                             dict(
@@ -152,7 +211,7 @@ class SpawnManager(BaseManager):
                             ),
                             unchangeable=True
                         )
-                    )  # lock the spawn positions
+                    )
                     if j == 0:
                         safe_spawn_places.append(copy.deepcopy(agent_configs[-1]))
         return agent_configs, safe_spawn_places

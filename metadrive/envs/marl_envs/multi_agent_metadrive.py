@@ -12,7 +12,7 @@ from metadrive.utils import setup_logger, get_np_random, Config
 MULTI_AGENT_METADRIVE_DEFAULT_CONFIG = dict(
     # ===== Multi-agent =====
     is_multi_agent=True,
-    num_agents=15,
+    num_agents=6,
     # If num_agents is set to None, then endless vehicles will be added only the empty spawn points exist
     random_agent_model=False,
     # If True, the spawn position will be deterministic for each episode, usually used for deterministic test

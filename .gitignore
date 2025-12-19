@@ -57,3 +57,8 @@
 # ignore documentation build output
 **/filtered_dataset
 **/semantics.png
+logs/
+*.pdf
+logs/
+__pycache__/
+*.pdf

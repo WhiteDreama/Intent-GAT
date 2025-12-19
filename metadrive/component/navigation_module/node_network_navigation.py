@@ -44,6 +44,15 @@ class NodeNetworkNavigation(BaseNavigation):
         possible_lanes = ray_localization(vehicle.heading, vehicle.spawn_place, self.engine, use_heading_filter=False)
         possible_lane_indexes = [lane_index for lane, lane_index, dist in possible_lanes]
 
+        # Fallback: if ray localization fails, try the configured spawn_lane_index directly
+        if len(possible_lanes) == 0 and vehicle.config.get("spawn_lane_index") is not None:
+            try:
+                lane = self.map.road_network.get_lane(vehicle.config["spawn_lane_index"])
+                possible_lanes = [(lane, vehicle.config["spawn_lane_index"], 0.0)]
+                possible_lane_indexes = [vehicle.config["spawn_lane_index"]]
+            except Exception:
+                pass
+
         if len(possible_lanes) == 0 and vehicle.config["spawn_lane_index"] is None:
             from metadrive.utils.error_class import NavigationError
             raise NavigationError("Can't find valid lane for navigation.")

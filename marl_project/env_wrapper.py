@@ -88,25 +88,22 @@ class GraphEnvWrapper(MultiAgentMetaDrive):
         Step the environment and process observations.
         Returns a 4-tuple (obs, rewards, dones, infos) so it can be used inside SubprocVecEnv workers.
         """
-        """
-        Step the environment and process observations.
-        """
-        # === [新增] 动作平滑处理 (Action Smoothing) ===
-        # 读取平滑系数 (0.0=无平滑, 1.0=完全不动)
-        # 建议设为 0.5 ~ 0.8
-        alpha = float(getattr(Config, "ACTION_SMOOTH_ALPHA", 0.6))
-        
+        # === 动作平滑处理 (Action Smoothing) ===
+        # 说明：只在环境侧做一次平滑，训练侧不要重复滤波。
+        alpha = float(getattr(Config, "ACTION_SMOOTH_ALPHA", 0.0))
+
         smoothed_actions = {}
+        if actions is None:
+            actions = {}
         for agent_id, action in actions.items():
-            # 获取上一步的动作 (如果也是第一步，就用当前的)
-            prev_act = self.prev_actions.get(agent_id, action)
-            
-            # 公式: New = alpha * Old + (1 - alpha) * Raw
-            # 这样动作就有了"惯性"，不可能瞬间从 -1 变到 1
-            smooth_act = alpha * prev_act + (1 - alpha) * action
-            smoothed_actions[agent_id] = smooth_act
-            
-        
+            act = np.asarray(action, dtype=np.float32)
+            if alpha > 1e-8:
+                prev_act = self.prev_actions.get(agent_id)
+                if prev_act is not None:
+                    prev_act = np.asarray(prev_act, dtype=np.float32)
+                    act = alpha * prev_act + (1.0 - alpha) * act
+            smoothed_actions[agent_id] = act
+
         obs, rewards, dones, truncated, infos = super().step(smoothed_actions)
 
         # Remove crashed traffic vehicles immediately (so collision counterpart disappears too)

@@ -38,7 +38,7 @@ class Config:
     
     
     # --- Auxiliary Task ---
-    PRED_WAYPOINTS_NUM = 6   # (辅助任务) 未来预测的路点数量
+    PRED_WAYPOINTS_NUM = 5   # (辅助任务) 未来预测的路点数量
     AUX_TASK_LOSS_COEF = 0.8      # (说明用) 辅助任务损失权重（训练时以 Training 区的 AUX_LOSS_COEF 为准）
     
     # --- Sim-to-Real / Robustness ---
@@ -47,7 +47,7 @@ class Config:
     COMM_RADIUS = 80       # (带宽) 通信半径，超过此距离邻居不可见
     SAFETY_DIST = 8.0        # 安全距离阈值，低于此距离会触发安全惩罚
     CRASH_PENALTY = -200.0    # 碰撞惩罚，较大地图下更温和以保持稳定性
-    SAFETY_PENALTY_SCALE = 0.5  # 当过于接近时，按比例缩放安全惩罚
+    SAFETY_PENALTY_SCALE = 1.0  # 当过于接近时，按比例缩放安全惩罚
     OUT_OF_ROAD_PENALTY = -200.0 # 当发生出路面事件时施加的惩罚
 
     # --- Dense, Hierarchical Expert Driver Reward ---
@@ -55,10 +55,10 @@ class Config:
     # 在弯道/大航向误差时降低目标速度，避免“速度奖励”顶着转弯/路口把车推向碰撞
     CURVE_SLOWDOWN_GAIN = 1.8       # 0~1，越大弯道降速越强
     MIN_TARGET_SPEED_KMH = 10.0     # 弯道最低目标速度（避免奖励被压成 0）
-    SPEED_REWARD_SCALE = 0.5 # 速度奖励的缩放系数
+    SPEED_REWARD_SCALE = 0.0 # 速度奖励的缩放系数
     OVERSPEED_PENALTY_SCALE = 1.0 # 超速惩罚的缩放系数
-    IDLE_SPEED_KMH = 1.0 # 当速度低于此值时，会施加额外的惩罚
-    IDLE_PENALTY = 0.5 # 当速度低于 IDLE_SPEED_KMH 时的惩罚系数
+    IDLE_SPEED_KMH = 5.0 # 当速度低于此值时，会施加额外的惩罚
+    IDLE_PENALTY = 5.0 # 当速度低于 IDLE_SPEED_KMH 时的惩罚系数
 
 
     # =========================================================
@@ -67,26 +67,43 @@ class Config:
     # train.py 会读取这些值作为“最大强度”。
     # 在训练初期，程序会自动将这些值设为 0，然后慢慢加到这里设定的值。
 
+    # =========================================================
+    # === [新增] Reward Curriculum Schedule (去重型化开关) ===
+    # =========================================================
+    # 用“进度比例 progress ∈ [0,1]”划分训练阶段。
+    # Phase1: 仅终止 + 进度；Phase2: 打开车道/航向；Phase3: 打开 safety/approach；Phase4: 打开 TTC/comfort/idle + speed shaping
+    CURR_PHASE1_END = 0.20
+    CURR_PHASE2_END = 0.50
+    CURR_PHASE3_END = 0.80
+
+    # 终止项（成功/碰撞/出界）在早期缩放，降低回报方差，帮助 value 稳定学习
+    # 0.3 表示：早期终止惩罚/奖励仅保留 30%
+    CURR_TERM_SCALE_START = 0.30
+    CURR_TERM_SCALE_END = 1.00
+
+    # 速度 shaping 何时启用：默认只在最后阶段打开
+    CURR_ENABLE_SPEED_IN_PHASE4 = True
+
     # --- TTC / Foreseeable Safety (Intersection-friendly) ---
     # 用邻居相对位置/速度近似 TTC，提前惩罚“即将发生的碰撞”
     TTC_THRESHOLD_S = 2.5           # 低于该 TTC 视为危险（秒）
-    TTC_PENALTY_SCALE = 0.8         # TTC 惩罚强度   <--- [重要修改] 设为 0.8 或 1.0，给模型一个明确的避险信号
+    TTC_PENALTY_SCALE = 1.2       # TTC 惩罚强度   <--- [重要修改] 设为 0.8 或 1.0，给模型一个明确的避险信号
     TTC_DIST_MAX = 25.0             # 只对该距离内邻居计算 TTC（米）
     TTC_CLOSING_SPEED_EPS = 0.5     # 认为在接近的最小闭合速度（m/s）
     
     
-    PROGRESS_REWARD_SCALE = 1.0 # 进度奖励的缩放系数
-    LANE_CENTER_PENALTY_SCALE = 0.5 # 车道中心惩罚的缩放系数
+    PROGRESS_REWARD_SCALE = 2.0 # 进度奖励的缩放系数
+    LANE_CENTER_PENALTY_SCALE = 1.0 # 车道中心惩罚的缩放系数
     LANE_WIDTH_REF = 3.6 # 车道宽度参考值，用于计算车道中心惩罚
     HEADING_PENALTY_SCALE = 0.3 # 角度误差惩罚的缩放系数
     MAX_HEADING_ERROR_RAD = 0.7 # 最大允许的角度误差（弧度）
     APPROACH_PENALTY_SCALE = 0.2 # 接近目标奖励的缩放系数
-    SUCCESS_REWARD = 200.0 # 成功完成一圈的奖励
+    SUCCESS_REWARD = 300.0 # 成功完成一圈的奖励
 
     # --- Action Smoothing / Comfort ---
     ACTION_SMOOTH_ALPHA = 0.5  # 低通滤波系数，越大越平滑
-    ACTION_CHANGE_PENALTY = 0.2  # 对动作变化幅度的惩罚系数
-    ACTION_MAG_PENALTY = 0.02     # 对动作幅值的惩罚系数（鼓励低加速度/低转向）
+    ACTION_CHANGE_PENALTY = 0.5  # 对动作变化幅度的惩罚系数
+    ACTION_MAG_PENALTY = 0.05     # 对动作幅值的惩罚系数（鼓励低加速度/低转向）
 
     # --- Deadlock / Long Idle (only when low risk) ---
     # “长期不动”定义：连续 N 步 低速 + 低进度，且周围风险低（避免误罚路口让行）
@@ -107,11 +124,11 @@ class Config:
     LR = 3e-4
     GAMMA = 0.99
     
-    NUM_ENVS = 32             # (训练) 并行环境数
+    NUM_ENVS = 48             # (训练) 并行环境数
     
     N_STEPS = 1024           # (训练) 每个环境的时间步长
-    BATCH_SIZE = 1024         # (训练) 每个 PPO 更新的批量大小  注意：如果 NUM_ENVS * N_STEPS 很大，BATCH_SIZE 可以适当增大
-    NUM_MINIBATCHES = 6      # (训练) 每个 PPO 更新的小批量数
+    BATCH_SIZE = 49152         # (训练) 每个 PPO 更新的批量大小  注意：如果 NUM_ENVS * N_STEPS 很大，BATCH_SIZE 可以适当增大
+    NUM_MINIBATCHES = 32      # (训练) 每个 PPO 更新的小批量数
     
     # --- Environment ---
     # Map switching
@@ -119,7 +136,7 @@ class Config:
     # - MAP_MODE="block_sequence": 按序列字符串生成（例如 "SSSSS", "X", "r" 等）
     MAP_MODE = "block_sequence"
     MAP_BLOCK_NUM = 7
-    MAP_TYPE = "SCrRT"           # 当 MAP_MODE="block_sequence" 时生效
+    MAP_TYPE = "C"           # 当 MAP_MODE="block_sequence" 时生效
     
     
     @staticmethod
@@ -154,7 +171,7 @@ class Config:
             "start_seed": getattr(Config, "BASE_SEED", 5000),
             
             # === 3. 流量适配：大地图需要更多车 ===
-            "num_agents": 1,          # 降低并发车流以减轻拥堵
+            "num_agents": 4,          # 降低并发车流以减轻拥堵
             "traffic_density": 0.00,   # 背景干扰车 (IDM Bot)
             "traffic_mode": "respawn", # 开启无限重生，保证路口永远繁忙
             "allow_respawn": True,     # 允许 RL Agent 撞车后复活继续训练

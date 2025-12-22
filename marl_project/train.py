@@ -32,13 +32,30 @@ _MAX_TTC_PENALTY_SCALE = float(getattr(Config, "TTC_PENALTY_SCALE", 0.0))
 _MAX_ACTION_MAG_PENALTY = float(getattr(Config, "ACTION_MAG_PENALTY", 0.0))
 _MAX_ACTION_CHANGE_PENALTY = float(getattr(Config, "ACTION_CHANGE_PENALTY", 0.0))
 
+# Reward curriculum maxima (read once from config)
+_MAX_LANE_CENTER_PENALTY_SCALE = float(getattr(Config, "LANE_CENTER_PENALTY_SCALE", 0.0))
+_MAX_HEADING_PENALTY_SCALE = float(getattr(Config, "HEADING_PENALTY_SCALE", 0.0))
+_MAX_SAFETY_PENALTY_SCALE = float(getattr(Config, "SAFETY_PENALTY_SCALE", 0.0))
+_MAX_APPROACH_PENALTY_SCALE = float(getattr(Config, "APPROACH_PENALTY_SCALE", 0.0))
+_MAX_IDLE_PENALTY = float(getattr(Config, "IDLE_PENALTY", 0.0))
+_MAX_IDLE_LONG_PENALTY = float(getattr(Config, "IDLE_LONG_PENALTY", 0.0))
+_MAX_SPEED_REWARD_SCALE = float(getattr(Config, "SPEED_REWARD_SCALE", 0.0))
+_MAX_OVERSPEED_PENALTY_SCALE = float(getattr(Config, "OVERSPEED_PENALTY_SCALE", 0.0))
+
+# Terminal reward magnitudes (keep as-is in config, but scale them by curriculum)
+_MAX_CRASH_PENALTY = float(getattr(Config, "CRASH_PENALTY", -200.0))
+_MAX_OUT_OF_ROAD_PENALTY = float(getattr(Config, "OUT_OF_ROAD_PENALTY", -200.0))
+_MAX_SUCCESS_REWARD = float(getattr(Config, "SUCCESS_REWARD", 300.0))
+
 
 def update_curriculum(current_step: int, total_steps: int):
     """Curriculum learning schedule.
 
-    Phase 1 (0-20%): disable TTC + comfort penalties.
-    Phase 2 (20-60%): linearly ramp TTC penalty to max.
-    Phase 3 (60-100%): enable comfort penalties.
+    De-heavy reward schedule:
+    - Phase 1 (0-20%): only terminal + progress; disable lane/heading/safety/TTC/comfort/idle.
+    - Phase 2 (20-50%): ramp lane/heading penalties.
+    - Phase 3 (50-80%): ramp safety/approach penalties.
+    - Phase 4 (80-100%): enable TTC + comfort + idle penalties.
     """
     if total_steps <= 0:
         progress = 1.0
@@ -46,23 +63,110 @@ def update_curriculum(current_step: int, total_steps: int):
         progress = float(current_step) / float(total_steps)
     progress = max(0.0, min(1.0, progress))
 
-    if progress < 0.2:
+    # Phase boundaries (configurable)
+    p1 = float(getattr(Config, "CURR_PHASE1_END", 0.2))
+    p2 = float(getattr(Config, "CURR_PHASE2_END", 0.5))
+    p3 = float(getattr(Config, "CURR_PHASE3_END", 0.8))
+    # sanitize ordering
+    if not (0.0 < p1 < p2 < p3 <= 1.0):
+        p1, p2, p3 = 0.2, 0.5, 0.8
+
+    term_start = float(getattr(Config, "CURR_TERM_SCALE_START", 0.3))
+    term_end = float(getattr(Config, "CURR_TERM_SCALE_END", 1.0))
+    term_start = max(0.0, min(1.0, term_start))
+    term_end = max(0.0, min(1.0, term_end))
+    if term_end < term_start:
+        term_start, term_end = term_end, term_start
+
+    enable_speed_phase4 = bool(getattr(Config, "CURR_ENABLE_SPEED_IN_PHASE4", True))
+
+    # Phase 1
+    if progress < p1:
+        # Reduce terminal magnitudes early to lower return variance (easier value learning)
+        term_scale = term_start
+        Config.CRASH_PENALTY = term_scale * _MAX_CRASH_PENALTY
+        Config.OUT_OF_ROAD_PENALTY = term_scale * _MAX_OUT_OF_ROAD_PENALTY
+        Config.SUCCESS_REWARD = term_scale * _MAX_SUCCESS_REWARD
+
+        Config.SPEED_REWARD_SCALE = 0.0
+        Config.OVERSPEED_PENALTY_SCALE = 0.0
+        Config.LANE_CENTER_PENALTY_SCALE = 0.0
+        Config.HEADING_PENALTY_SCALE = 0.0
+        Config.SAFETY_PENALTY_SCALE = 0.0
+        Config.APPROACH_PENALTY_SCALE = 0.0
         Config.TTC_PENALTY_SCALE = 0.0
         Config.ACTION_MAG_PENALTY = 0.0
         Config.ACTION_CHANGE_PENALTY = 0.0
+        Config.IDLE_PENALTY = 0.0
+        Config.IDLE_LONG_PENALTY = 0.0
         return
 
-    if progress < 0.6:
-        t = (progress - 0.2) / 0.4
-        Config.TTC_PENALTY_SCALE = float(t) * _MAX_TTC_PENALTY_SCALE
+    # Phase 2: lane/heading
+    if progress < p2:
+        t = (progress - p1) / max(1e-8, (p2 - p1))
+        t = max(0.0, min(1.0, t))
+        # Linearly restore terminal magnitudes in this phase
+        term_scale = term_start + (term_end - term_start) * t
+        Config.CRASH_PENALTY = term_scale * _MAX_CRASH_PENALTY
+        Config.OUT_OF_ROAD_PENALTY = term_scale * _MAX_OUT_OF_ROAD_PENALTY
+        Config.SUCCESS_REWARD = term_scale * _MAX_SUCCESS_REWARD
+
+        # keep speed shaping disabled in early training
+        Config.SPEED_REWARD_SCALE = 0.0
+        Config.OVERSPEED_PENALTY_SCALE = 0.0
+        Config.LANE_CENTER_PENALTY_SCALE = float(t) * _MAX_LANE_CENTER_PENALTY_SCALE
+        Config.HEADING_PENALTY_SCALE = float(t) * _MAX_HEADING_PENALTY_SCALE
+        Config.SAFETY_PENALTY_SCALE = 0.0
+        Config.APPROACH_PENALTY_SCALE = 0.0
+        Config.TTC_PENALTY_SCALE = 0.0
         Config.ACTION_MAG_PENALTY = 0.0
         Config.ACTION_CHANGE_PENALTY = 0.0
+        Config.IDLE_PENALTY = 0.0
+        Config.IDLE_LONG_PENALTY = 0.0
         return
 
-    # Phase 3
+    # Phase 3: safety/approach
+    if progress < p3:
+        t = (progress - p2) / max(1e-8, (p3 - p2))
+        t = max(0.0, min(1.0, t))
+        # Terminal magnitudes fully enabled from here
+        Config.CRASH_PENALTY = _MAX_CRASH_PENALTY
+        Config.OUT_OF_ROAD_PENALTY = _MAX_OUT_OF_ROAD_PENALTY
+        Config.SUCCESS_REWARD = _MAX_SUCCESS_REWARD
+
+        # optionally ramp in speed shaping slightly later (kept simple: off until final phase)
+        Config.SPEED_REWARD_SCALE = 0.0
+        Config.OVERSPEED_PENALTY_SCALE = 0.0
+        Config.LANE_CENTER_PENALTY_SCALE = _MAX_LANE_CENTER_PENALTY_SCALE
+        Config.HEADING_PENALTY_SCALE = _MAX_HEADING_PENALTY_SCALE
+        Config.SAFETY_PENALTY_SCALE = float(t) * _MAX_SAFETY_PENALTY_SCALE
+        Config.APPROACH_PENALTY_SCALE = float(t) * _MAX_APPROACH_PENALTY_SCALE
+        Config.TTC_PENALTY_SCALE = 0.0
+        Config.ACTION_MAG_PENALTY = 0.0
+        Config.ACTION_CHANGE_PENALTY = 0.0
+        Config.IDLE_PENALTY = 0.0
+        Config.IDLE_LONG_PENALTY = 0.0
+        return
+
+    # Phase 4: TTC + comfort + idle
+    Config.CRASH_PENALTY = _MAX_CRASH_PENALTY
+    Config.OUT_OF_ROAD_PENALTY = _MAX_OUT_OF_ROAD_PENALTY
+    Config.SUCCESS_REWARD = _MAX_SUCCESS_REWARD
+    if enable_speed_phase4:
+        Config.SPEED_REWARD_SCALE = _MAX_SPEED_REWARD_SCALE
+        Config.OVERSPEED_PENALTY_SCALE = _MAX_OVERSPEED_PENALTY_SCALE
+    else:
+        Config.SPEED_REWARD_SCALE = 0.0
+        Config.OVERSPEED_PENALTY_SCALE = 0.0
+    Config.LANE_CENTER_PENALTY_SCALE = _MAX_LANE_CENTER_PENALTY_SCALE
+    Config.HEADING_PENALTY_SCALE = _MAX_HEADING_PENALTY_SCALE
+    Config.SAFETY_PENALTY_SCALE = _MAX_SAFETY_PENALTY_SCALE
+    Config.APPROACH_PENALTY_SCALE = _MAX_APPROACH_PENALTY_SCALE
     Config.TTC_PENALTY_SCALE = _MAX_TTC_PENALTY_SCALE
     Config.ACTION_MAG_PENALTY = _MAX_ACTION_MAG_PENALTY
     Config.ACTION_CHANGE_PENALTY = _MAX_ACTION_CHANGE_PENALTY
+    Config.IDLE_PENALTY = _MAX_IDLE_PENALTY
+    Config.IDLE_LONG_PENALTY = _MAX_IDLE_LONG_PENALTY
 
 
 def _vec_to_list(x, num_envs: int):
@@ -220,7 +324,7 @@ def train():
     args = parse_args()
     update_config(args)
 
-    log_dir = "logs/marl_experiment/cornering"
+    log_dir = "logs/marl_experiment/cornering_v2"
     os.makedirs(log_dir, exist_ok=True)
     
     # Save config for reproducibility
@@ -293,7 +397,7 @@ def train():
     print(f"Initialized Policy. Input: {input_dim}, Action: {action_dim}")
     
     # --- Training Parameters ---
-    num_updates = 3500
+    num_updates = 500
     steps_per_update = Config.N_STEPS
     gamma = Config.GAMMA
     gae_lambda = 0.95
@@ -353,9 +457,20 @@ def train():
         
         # === 同步 Curriculum 参数到所有 worker ===
         curriculum_params = {
+            "CRASH_PENALTY": getattr(Config, "CRASH_PENALTY", -200.0),
+            "OUT_OF_ROAD_PENALTY": getattr(Config, "OUT_OF_ROAD_PENALTY", -200.0),
+            "SUCCESS_REWARD": getattr(Config, "SUCCESS_REWARD", 300.0),
             "TTC_PENALTY_SCALE": Config.TTC_PENALTY_SCALE,
             "ACTION_MAG_PENALTY": Config.ACTION_MAG_PENALTY,
-            "ACTION_CHANGE_PENALTY": Config.ACTION_CHANGE_PENALTY
+            "ACTION_CHANGE_PENALTY": Config.ACTION_CHANGE_PENALTY,
+            "LANE_CENTER_PENALTY_SCALE": getattr(Config, "LANE_CENTER_PENALTY_SCALE", 0.0),
+            "HEADING_PENALTY_SCALE": getattr(Config, "HEADING_PENALTY_SCALE", 0.0),
+            "SAFETY_PENALTY_SCALE": getattr(Config, "SAFETY_PENALTY_SCALE", 0.0),
+            "APPROACH_PENALTY_SCALE": getattr(Config, "APPROACH_PENALTY_SCALE", 0.0),
+            "IDLE_PENALTY": getattr(Config, "IDLE_PENALTY", 0.0),
+            "IDLE_LONG_PENALTY": getattr(Config, "IDLE_LONG_PENALTY", 0.0),
+            "SPEED_REWARD_SCALE": getattr(Config, "SPEED_REWARD_SCALE", 0.0),
+            "OVERSPEED_PENALTY_SCALE": getattr(Config, "OVERSPEED_PENALTY_SCALE", 0.0),
         }
         envs.env_method("update_config_params", curriculum_params)
         # ==========================================
@@ -380,6 +495,7 @@ def train():
         reward_steps = 0
         event_counts = defaultdict(int)
         risk_stats = defaultdict(float)
+        graph_stats = defaultdict(float)
         
         # Parallel reset: keep list[dict] obs for existing rollout logic
         # diversify scenario indices deterministically within each worker's scenario range
@@ -387,8 +503,6 @@ def train():
         reset_seeds = [int(base_seed + i + ((update - 1) % max(1, num_scenarios))) for i in range(num_envs)]
         obs_list = envs.reset(seeds=reset_seeds)
         episode_rewards = [{a_id: 0.0 for a_id in obs} for obs in obs_list]
-        # Track previous actions per env for smoothing
-        prev_actions = [dict() for _ in range(num_envs)]
         
         for step in range(steps_per_update):
             global_step += 1
@@ -420,8 +534,11 @@ def train():
                     raw_rel_pos = agent_obs['neighbor_rel_pos']
 
                     for i, n_id in enumerate(raw_neighbors):
-                        if n_id in agent_to_idx:
-                            n_indices.append(agent_to_idx[n_id])
+                        # Neighbor ids are per-env. We must namespace them by env_idx to map into the
+                        # flattened (env, agent) batch index space.
+                        neighbor_key = f"{env_idx}:{n_id}"
+                        if neighbor_key in agent_to_idx:
+                            n_indices.append(agent_to_idx[neighbor_key])
                             n_mask.append(1.0)
                             n_rel_pos.append(raw_rel_pos[i])
 
@@ -450,6 +567,15 @@ def train():
                 "neighbor_rel_pos": torch.tensor(np.array(batch_neighbor_rel_pos), dtype=torch.float32),
                 "gt_waypoints": torch.tensor(np.array(batch_gt_waypoints), dtype=torch.float32)
             }
+
+            # Graph connectivity stats (how many valid neighbors per ego)
+            try:
+                nmask_np = np.asarray(batch_neighbor_mask, dtype=np.float32)
+                valid_n = float(np.sum(nmask_np, axis=1).mean()) if nmask_np.size > 0 else 0.0
+                graph_stats["neighbors_mean_sum"] += valid_n
+                graph_stats["neighbors_n"] += 1.0
+            except Exception:
+                pass
             
             # Inference (using forward_actor_critic for no_grad)
             results = policy.forward_actor_critic({k: v.to(device, non_blocking=True) for k, v in obs_tensor_batch.items()})
@@ -471,28 +597,14 @@ def train():
                 env_action_dict = {}
                 for j, aid in enumerate(obs_dict.keys()):
                     raw_act = actions[cursor + j].cpu().numpy()
-                    prev = prev_actions[env_idx].get(aid)
-                    if prev is not None:
-                        smoothed = Config.ACTION_SMOOTH_ALPHA * prev + (1 - Config.ACTION_SMOOTH_ALPHA) * raw_act
-                    else:
-                        smoothed = raw_act
-                    smoothed = clip_action(smoothed)
-                    env_action_dict[aid] = smoothed
-                    prev_actions[env_idx][aid] = smoothed
+                    raw_act = clip_action(raw_act)
+                    env_action_dict[aid] = raw_act
                 env_actions.append(env_action_dict)
                 cursor += count
 
             # Parallel step
             next_obs_list, rewards_list, dones_list, infos_list = envs.step(env_actions)
 
-            # Clear history for terminated agents to avoid stale smoothing
-            for env_idx in range(num_envs):
-                n_dones = dones_list[env_idx]
-                if isinstance(n_dones, dict):
-                    for aid, done_flag in n_dones.items():
-                        if done_flag:
-                            prev_actions[env_idx].pop(aid, None)
-            
             # Track Rewards
             for env_idx, obs_dict in enumerate(obs_list):
                 rewards = rewards_list[env_idx]
@@ -722,9 +834,17 @@ def train():
         mean_step_reward = flat_rewards.mean().item()
         writer.add_scalar("Reward/Mean_Step", mean_step_reward, global_step)
         denom = max(1, reward_steps)
-        writer.add_scalar("RewardDecomp/CrashPenalty_per_step", reward_components.get("crash_penalty", 0.0) / denom, global_step)
-        writer.add_scalar("RewardDecomp/SafetyPenalty_per_step", reward_components.get("safety_penalty", 0.0) / denom, global_step)
-        writer.add_scalar("RewardDecomp/Total_per_step", reward_components.get("total", 0.0) / denom, global_step)
+        # Full reward breakdown (per-step average)
+        for k, v in sorted(reward_components.items()):
+            # total/base are still useful; skip if not numeric
+            try:
+                writer.add_scalar(f"RewardDecomp/{k}_per_step", float(v) / denom, global_step)
+            except Exception:
+                continue
+
+        # Graph stats (per rollout step)
+        g_n = max(1.0, graph_stats.get("neighbors_n", 0.0))
+        writer.add_scalar("Graph/MeanValidNeighbors", float(graph_stats.get("neighbors_mean_sum", 0.0)) / g_n, global_step)
 
         # Terminal proportions (per-update)
         term_denom = max(1, int(event_counts.get("terminal_total", 0)))
@@ -748,6 +868,22 @@ def train():
         writer.add_scalar("Risk/MeanMinDist", float(risk_stats.get("min_dist_sum", 0.0)) / steps_with_dist, global_step)
         idle_n = max(1.0, risk_stats.get("idle_count_n", 0.0))
         writer.add_scalar("Deadlock/MeanIdleCount", float(risk_stats.get("idle_count_sum", 0.0)) / idle_n, global_step)
+
+        # Curriculum visibility
+        writer.add_scalar("Curriculum/SPEED_REWARD_SCALE", float(getattr(Config, "SPEED_REWARD_SCALE", 0.0)), global_step)
+        writer.add_scalar("Curriculum/OVERSPEED_PENALTY_SCALE", float(getattr(Config, "OVERSPEED_PENALTY_SCALE", 0.0)), global_step)
+        writer.add_scalar("Curriculum/LANE_CENTER_PENALTY_SCALE", float(getattr(Config, "LANE_CENTER_PENALTY_SCALE", 0.0)), global_step)
+        writer.add_scalar("Curriculum/HEADING_PENALTY_SCALE", float(getattr(Config, "HEADING_PENALTY_SCALE", 0.0)), global_step)
+        writer.add_scalar("Curriculum/SAFETY_PENALTY_SCALE", float(getattr(Config, "SAFETY_PENALTY_SCALE", 0.0)), global_step)
+        writer.add_scalar("Curriculum/APPROACH_PENALTY_SCALE", float(getattr(Config, "APPROACH_PENALTY_SCALE", 0.0)), global_step)
+        writer.add_scalar("Curriculum/TTC_PENALTY_SCALE", float(getattr(Config, "TTC_PENALTY_SCALE", 0.0)), global_step)
+        writer.add_scalar("Curriculum/ACTION_MAG_PENALTY", float(getattr(Config, "ACTION_MAG_PENALTY", 0.0)), global_step)
+        writer.add_scalar("Curriculum/ACTION_CHANGE_PENALTY", float(getattr(Config, "ACTION_CHANGE_PENALTY", 0.0)), global_step)
+        writer.add_scalar("Curriculum/IDLE_PENALTY", float(getattr(Config, "IDLE_PENALTY", 0.0)), global_step)
+        writer.add_scalar("Curriculum/IDLE_LONG_PENALTY", float(getattr(Config, "IDLE_LONG_PENALTY", 0.0)), global_step)
+        writer.add_scalar("Curriculum/CRASH_PENALTY", float(getattr(Config, "CRASH_PENALTY", -200.0)), global_step)
+        writer.add_scalar("Curriculum/OUT_OF_ROAD_PENALTY", float(getattr(Config, "OUT_OF_ROAD_PENALTY", -200.0)), global_step)
+        writer.add_scalar("Curriculum/SUCCESS_REWARD", float(getattr(Config, "SUCCESS_REWARD", 300.0)), global_step)
         
         mean_ep_reward = 0.0
         if len(completed_episode_rewards) > 0:

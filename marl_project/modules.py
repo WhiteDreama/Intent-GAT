@@ -31,10 +31,10 @@ class IntentEncoder(nn.Module):
         # Input: (Batch, 1, 72)
         self.lidar_cnn = nn.Sequential(
             # Layer 1: Detect local patterns (e.g., 5 points window)
-            nn.Conv1d(in_channels=1, out_channels=16, kernel_size=5, stride=2, padding=2),
+            nn.Conv1d(in_channels=1, out_channels=16, kernel_size=5, stride=2, padding=2, padding_mode='circular'),
             nn.ReLU(),
             # Layer 2: Aggregate features
-            nn.Conv1d(in_channels=16, out_channels=32, kernel_size=3, stride=2, padding=1),
+            nn.Conv1d(in_channels=16, out_channels=32, kernel_size=3, stride=2, padding=1, padding_mode='circular'),
             nn.ReLU(),
             # Output shape calculation:
             # 72 -> /2 -> 36 -> /2 -> 18

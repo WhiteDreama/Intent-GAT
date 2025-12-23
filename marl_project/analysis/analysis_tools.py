@@ -1,3 +1,27 @@
+"""
+深度诊断与轨迹分析工具 (Deep Analysis Tools)
+
+【功能说明】
+读取由 evaluate.py 生成的 `eval_details.json` 详细日志，进行微观层面的分析。
+用于诊断模型是“不动”、“乱冲”还是“转弯失败”。
+
+【前置条件】
+运行 evaluate.py 时必须使用了 `--save_details_json` 参数。
+
+【终端用法示例】
+
+1. 基础用法:
+   python marl_project/analysis_tools.py --file logs/eval_details.json
+
+2. 指定输出目录:
+   python marl_project/analysis_tools.py --file logs/eval_details.json --out logs/analysis_result/
+
+【输出结果】
+- trajectory_viz.png:  车辆行驶轨迹图 (热力图显示速度)。
+- failure_analysis.png: 出界前的最后时刻分析 (横向偏移 vs 时间)。
+- speed_hist.png:      速度分布直方图 (判断是否怠速)。
+- termination_pie.png: 结局分布饼图。
+"""
 import json
 import os
 import argparse

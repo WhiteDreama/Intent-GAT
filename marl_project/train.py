@@ -201,6 +201,7 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=Config.BATCH_SIZE, help="Batch size")
     parser.add_argument("--ppo_epochs", type=int, default=Config.PPO_EPOCHS, help="PPO epochs")
     parser.add_argument("--aux_loss_coef", type=float, default=Config.AUX_LOSS_COEF, help="Aux loss coefficient")
+    parser.add_argument("--exp_name", type=str, default=None, help="本次实验的名称，将决定日志保存在哪里")
     # Map switching
     parser.add_argument(
         "--map_mode",
@@ -317,20 +318,42 @@ class _EnvFactory:
 
 def train():
     # --- Setup ---
-    # Seed
+    # 统一缩进：建议每一级缩进都严格使用 4 个空格
     torch.manual_seed(42)
-    np.random.seed(42)
+    np.random.seed(42)  # <--- 之前报错的就是这里
     
     args = parse_args()
-    update_config(args)
+    
+    # 1. 确定实验名称
+    # 优先级：命令行参数 > Config默认值
+    # 注意：确保你的 Config 类里加了 EXP_NAME = "default" 之类的默认值
+    exp_name = args.exp_name if args.exp_name else getattr(Config, "EXP_NAME", "default_experiment")
+    
+    # 2. 动态拼接路径
+    # 注意：确保你的 Config 类里加了 LOG_ROOT = "logs/marl_experiment"
+    log_root = getattr(Config, "LOG_ROOT", "logs/marl_experiment")
+    log_dir = os.path.join(log_root, exp_name)
+    
+    # 3. (可选但推荐) 防止手滑覆盖重要实验
+    if os.path.exists(log_dir) and os.listdir(log_dir):
+        print(f"⚠️ 警告: 日志目录 {log_dir} 已存在且非空！")
+        # raise ValueError("请更换实验名称或删除旧文件夹！") # 如果你想强制报错，取消注释这一行
 
-    log_dir = "logs/marl_experiment/cornering_v2"
     os.makedirs(log_dir, exist_ok=True)
     
+    print(f"📂 本次训练日志将保存在: {log_dir}")
+    
+    # 更新配置（如果有覆盖逻辑）
+    update_config(args)
+    
     # Save config for reproducibility
-    config_path = os.path.join(os.path.dirname(__file__), "config.py")
+    # 确保能找到 config.py 文件，如果你的 train.py 和 config.py 在同一级目录：
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.py")
     if os.path.exists(config_path):
+        import shutil # 确保导入了 shutil
         shutil.copy(config_path, log_dir)
+    else:
+        print(f"⚠️ 警告: 找不到 config.py ({config_path})，跳过备份。")
         
     # Dump final config to hparams.json
     hparams = {k: v for k, v in Config.__dict__.items() if not k.startswith('__') and not callable(v)}

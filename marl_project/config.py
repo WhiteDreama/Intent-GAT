@@ -92,10 +92,10 @@ class Config:
     TTC_CLOSING_SPEED_EPS = 0.5     # 认为在接近的最小闭合速度（m/s）
     
     
-    PROGRESS_REWARD_SCALE = 2.0 # 进度奖励的缩放系数
-    LANE_CENTER_PENALTY_SCALE = 1.0 # 车道中心惩罚的缩放系数
+    PROGRESS_REWARD_SCALE = 1.0 # 进度奖励的缩放系数
+    LANE_CENTER_PENALTY_SCALE = 0.5 # 车道中心惩罚的缩放系数
     LANE_WIDTH_REF = 3.6 # 车道宽度参考值，用于计算车道中心惩罚
-    HEADING_PENALTY_SCALE = 0.3 # 角度误差惩罚的缩放系数
+    HEADING_PENALTY_SCALE = 0.5 # 角度误差惩罚的缩放系数
     MAX_HEADING_ERROR_RAD = 0.7 # 最大允许的角度误差（弧度）
     APPROACH_PENALTY_SCALE = 0.2 # 接近目标奖励的缩放系数
     SUCCESS_REWARD = 300.0 # 成功完成一圈的奖励
@@ -121,7 +121,7 @@ class Config:
     CLIP_EPSILON = 0.20       # PPO clip epsilon
     ENTROPY_COEF = 0.01     # 稍微降低熵以减少噪声动作
     MAX_GRAD_NORM = 0.5      # 梯度裁剪范数
-    LR = 3e-4
+    LR = 5e-5
     GAMMA = 0.99
     
     NUM_ENVS = 48             # (训练) 并行环境数
@@ -129,14 +129,20 @@ class Config:
     N_STEPS = 1024           # (训练) 每个环境的时间步长
     BATCH_SIZE = 49152         # (训练) 每个 PPO 更新的批量大小  注意：如果 NUM_ENVS * N_STEPS 很大，BATCH_SIZE 可以适当增大
     NUM_MINIBATCHES = 32      # (训练) 每个 PPO 更新的小批量数
+    # 1. 设置一个基础的日志目录
+    LOG_ROOT = "logs/marl_experiment"
+    
+    # 2. 设置一个默认的实验名称 (防止你忘记传参时有个兜底)
+    EXP_NAME = "default"
+    
     
     # --- Environment ---
     # Map switching
     # - MAP_MODE="block_num":  程序化城市（按 block 数生成）
     # - MAP_MODE="block_sequence": 按序列字符串生成（例如 "SSSSS", "X", "r" 等）
     MAP_MODE = "block_sequence"
-    MAP_BLOCK_NUM = 7
-    MAP_TYPE = "C"           # 当 MAP_MODE="block_sequence" 时生效
+    MAP_BLOCK_NUM = 3
+    MAP_TYPE = "SCS"           # 当 MAP_MODE="block_sequence" 时生效
     
     
     @staticmethod
@@ -150,7 +156,7 @@ class Config:
             map_config = {
                 "type": "block_sequence",
                 "config": getattr(Config, "MAP_TYPE", "SSSSS"),
-                "lane_num": 2,
+                "lane_num": 3,
             }
         else:
             map_config = {
@@ -171,7 +177,7 @@ class Config:
             "start_seed": getattr(Config, "BASE_SEED", 5000),
             
             # === 3. 流量适配：大地图需要更多车 ===
-            "num_agents": 4,          # 降低并发车流以减轻拥堵
+            "num_agents": 2,          # 降低并发车流以减轻拥堵
             "traffic_density": 0.00,   # 背景干扰车 (IDM Bot)
             "traffic_mode": "respawn", # 开启无限重生，保证路口永远繁忙
             "allow_respawn": True,     # 允许 RL Agent 撞车后复活继续训练

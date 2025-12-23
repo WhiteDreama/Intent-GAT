@@ -1,9 +1,34 @@
-"""Checkpoint evaluation entrypoint.
+"""
+模型评估主程序 (Evaluation Entrypoint)
 
-Usage examples:
-    python marl_project/evaluate.py --model_path logs/.../ckpt_000600.pth --episodes 10
-    python marl_project/evaluate.py --model_path logs/.../ckpt_000600.pth --episodes 10 --render --top_down
-    python marl_project/evaluate.py --model_path logs/.../ckpt_000600.pth --episodes 50 --noise 0 --mask 0 --save_json logs/eval_summary.json
+【功能说明】
+1. 加载训练好的模型权重 (.pth)。
+2. 在 MetaDrive 环境中运行指定次数的测试。
+3. 生成三种类型的数据供下游工具分析：
+   - Summary JSON: 总体评分 (供 print_report.py 使用)
+   - Details JSON: 详细轨迹 (供 analysis_tools.py 使用)
+   - CSV Table:    批量对比表 (供 plot_benchmark.py 使用)
+4. 支持实时渲染和视频录制。
+
+【终端用法示例】
+
+1. 单个模型测试 (生成详细数据用于分析):
+   python marl_project/evaluate.py --model_path logs/exp/ckpt_000200.pth --episodes 10 --save_json logs/summary.json --save_details_json logs/details.json
+
+2. 批量模型对比 (生成 CSV 用于画趋势图):
+   python marl_project/evaluate.py --model_glob "logs/exp/ckpt_*.pth" --episodes 5 --save_table logs/benchmark.csv
+
+3. 可视化模式 (观看驾驶效果):
+   python marl_project/evaluate.py --model_path logs/exp/best.pth --render --top_down --episodes 3
+
+4. 强制指定地图 (例如只跑直道):
+   python marl_project/evaluate.py --model_path logs/exp/best.pth --map_sequence "S"
+
+【关键参数】
+--model_path: 指定单个模型路径。
+--model_glob: 指定通配符路径 (如 "ckpt_*.pth")，用于批量评估。
+--save_details_json: ⚠️ 必须开启此项才能使用 analysis_tools.py。
+--save_table: ⚠️ 必须开启此项才能使用 plot_benchmark.py。
 """
 
 import os
@@ -13,6 +38,7 @@ import argparse
 import glob
 import re
 import csv
+import time
 from collections import defaultdict, deque
 from typing import Dict, Any, List, Tuple, Optional
 
@@ -150,6 +176,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top_down", action="store_true", help="Use top-down render mode when rendering")
     parser.add_argument("--draw_connections", action="store_true", help="Draw lines between communicating agents")
 
+    # Visualization quality-of-life
+    parser.add_argument(
+        "--render_sleep",
+        type=float,
+        default=None,
+        help="Sleep seconds per step when --render is enabled (helps keep window visible). Default: 1/60.",
+    )
+    parser.add_argument(
+        "--pause_on_start",
+        type=float,
+        default=0.0,
+        help="If >0, pause this many seconds after first reset (keeps window open).",
+    )
+    parser.add_argument(
+        "--pause_at_end",
+        action="store_true",
+        help="If set, wait for Enter before exiting (keeps render window open).",
+    )
+
     # Evaluation protocol controls
     parser.add_argument(
         "--eval_full_reward",
@@ -280,6 +325,27 @@ def _apply_reward_params(params: Dict[str, float]) -> None:
                 setattr(Config, k, v)
 
 
+def _maybe_fix_vehicle_model_for_render(eval_config: Dict[str, Any], args: argparse.Namespace) -> None:
+    """Best-effort workaround for Windows/Panda3D crashes when loading some vehicle glTF assets.
+
+    On some Windows setups, using onscreen rendering with certain vehicle models (notably "s") can
+    trigger a hard crash (access violation) inside Panda3D's model loader. During evaluation, when
+    the user explicitly requests --render, we switch to a safer default visual model.
+    """
+    if not bool(getattr(args, "render", False)):
+        return
+
+    vc = eval_config.get("vehicle_config")
+    if not isinstance(vc, dict):
+        return
+
+    vm = vc.get("vehicle_model")
+    if vm == "s":
+        vc["vehicle_model"] = "default"
+        print('[Eval][Render] Detected vehicle_model="s" which may crash onscreen rendering on Windows; '
+              'switching to vehicle_model="default" for visualization.')
+
+
 def _maybe_get_imageio():
     try:
         import imageio.v2 as imageio  # type: ignore
@@ -390,6 +456,13 @@ def evaluate_single_model(model_path: str, args: argparse.Namespace) -> Tuple[Di
         eval_config["window_size"] = (800, 600)
         eval_config["force_render_fps"] = 60
 
+    if bool(args.render):
+        # Make the onscreen window more obvious.
+        eval_config["show_fps"] = True
+        eval_config["show_interface"] = True
+
+    _maybe_fix_vehicle_model_for_render(eval_config, args)
+
     if args.num_agents is not None:
         eval_config["num_agents"] = int(args.num_agents)
 
@@ -411,6 +484,16 @@ def evaluate_single_model(model_path: str, args: argparse.Namespace) -> Tuple[Di
     if not obs_dict:
         env.close()
         raise RuntimeError("Empty observation on reset. Check env config.")
+
+    # Render one frame immediately so the window has a chance to appear.
+    if bool(args.render):
+        try:
+            env.render()
+        except Exception:
+            pass
+        pause_s = float(getattr(args, "pause_on_start", 0.0) or 0.0)
+        if pause_s > 0:
+            time.sleep(pause_s)
 
     sample_agent = list(obs_dict.keys())[0]
     input_dim = int(obs_dict[sample_agent]["node_features"].shape[0])
@@ -496,16 +579,39 @@ def evaluate_single_model(model_path: str, args: argparse.Namespace) -> Tuple[Di
             if args.max_steps is not None and step_idx >= int(args.max_steps):
                 break
 
-            # Render / record frame (top-down)
+            # Render / record frame
+            # NOTE:
+            # - MetaDrive's render(mode="top_down") is typically an offscreen top-down frame (for recording/analysis)
+            #   and may NOT refresh the onscreen window.
+            # - To ensure the visualization window shows up when --render is set, always drive onscreen render().
             frame = None
             if use_render:
-                render_kwargs = {"mode": "top_down"} if (args.top_down or want_record) else {}
-                try:
-                    frame = env.render(**render_kwargs)
-                except Exception:
-                    frame = None
+                # Always refresh onscreen window when requested.
+                if bool(args.render):
+                    try:
+                        env.render()
+                    except Exception:
+                        pass
+
+                # Optionally capture a top-down frame for recording / screenshots.
+                if bool(args.top_down) or want_record:
+                    try:
+                        frame = env.render(mode="top_down")
+                    except Exception:
+                        frame = None
+
                 if args.draw_connections:
                     _draw_communication_lines(env, obs_dict)
+
+                # When visualizing (not recording), slow down so the window doesn't flash and close immediately.
+                if bool(args.render) and not want_record:
+                    sleep_s = getattr(args, "render_sleep", None)
+                    if sleep_s is None:
+                        sleep_s = 1.0 / 60.0
+                    try:
+                        time.sleep(float(sleep_s))
+                    except Exception:
+                        pass
 
             if want_record and imageio is not None:
                 if video_writer is not None and frame is not None:
@@ -667,6 +773,13 @@ def evaluate_single_model(model_path: str, args: argparse.Namespace) -> Tuple[Di
             )
 
     env.close()
+
+    if bool(args.render) and bool(getattr(args, "pause_at_end", False)):
+        try:
+            input("[Eval][Render] Press Enter to exit...")
+        except Exception:
+            # Non-interactive terminal
+            pass
 
     success = terminal_counts.get("success", 0)
     crash = terminal_counts.get("crash", 0)

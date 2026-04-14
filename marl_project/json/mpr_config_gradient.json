@@ -1,0 +1,82 @@
+[
+  {
+    "name": "grad_a2_d0p00",
+    "num_agents": 2,
+    "traffic_density": 0.00
+  },
+  {
+    "name": "grad_a4_d0p00",
+    "num_agents": 4,
+    "traffic_density": 0.00
+  },
+  {
+    "name": "grad_a6_d0p00",
+    "num_agents": 6,
+    "traffic_density": 0.00
+  },
+  {
+    "name": "grad_a8_d0p00",
+    "num_agents": 8,
+    "traffic_density": 0.00
+  },
+  {
+    "name": "grad_a2_d0p10",
+    "num_agents": 2,
+    "traffic_density": 0.10
+  },
+  {
+    "name": "grad_a4_d0p10",
+    "num_agents": 4,
+    "traffic_density": 0.10
+  },
+  {
+    "name": "grad_a6_d0p10",
+    "num_agents": 6,
+    "traffic_density": 0.10
+  },
+  {
+    "name": "grad_a8_d0p10",
+    "num_agents": 8,
+    "traffic_density": 0.10
+  },
+  {
+    "name": "grad_a4_d0p15",
+    "num_agents": 4,
+    "traffic_density": 0.15
+  },
+  {
+    "name": "grad_a6_d0p15",
+    "num_agents": 6,
+    "traffic_density": 0.15
+  },
+  {
+    "name": "grad_a8_d0p15",
+    "num_agents": 8,
+    "traffic_density": 0.15
+  },
+  {
+    "name": "grad_a4_d0p20",
+    "num_agents": 4,
+    "traffic_density": 0.20
+  },
+  {
+    "name": "grad_a6_d0p20",
+    "num_agents": 6,
+    "traffic_density": 0.20
+  },
+  {
+    "name": "grad_a8_d0p20",
+    "num_agents": 8,
+    "traffic_density": 0.20
+  },
+  {
+    "name": "grad_a6_d0p25",
+    "num_agents": 6,
+    "traffic_density": 0.25
+  },
+  {
+    "name": "grad_a8_d0p25",
+    "num_agents": 8,
+    "traffic_density": 0.25
+  }
+]

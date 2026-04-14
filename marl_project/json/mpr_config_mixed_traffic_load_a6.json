@@ -1,0 +1,7 @@
+[
+  {"name": "a6_d0p00", "num_agents": 6, "traffic_density": 0.00},
+  {"name": "a6_d0p05", "num_agents": 6, "traffic_density": 0.05},
+  {"name": "a6_d0p10", "num_agents": 6, "traffic_density": 0.10},
+  {"name": "a6_d0p15", "num_agents": 6, "traffic_density": 0.15},
+  {"name": "a6_d0p20", "num_agents": 6, "traffic_density": 0.20}
+]

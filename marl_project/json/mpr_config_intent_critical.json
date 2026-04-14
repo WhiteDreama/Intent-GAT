@@ -1,0 +1,74 @@
+[
+  {
+    "name": "baseline_a2_d0p00",
+    "num_agents": 2,
+    "traffic_density": 0.00,
+    "comment": "基线：2车无背景车（简单协作）"
+  },
+  {
+    "name": "baseline_a4_d0p00",
+    "num_agents": 4,
+    "traffic_density": 0.00,
+    "comment": "基线：4车无背景车（中等协作）"
+  },
+  {
+    "name": "critical_a4_d0p15",
+    "num_agents": 4,
+    "traffic_density": 0.15,
+    "comment": "关键场景：4车+中高密度背景车（开始出现遮挡）"
+  },
+  {
+    "name": "critical_a6_d0p15",
+    "num_agents": 6,
+    "traffic_density": 0.15,
+    "comment": "关键场景：6车+中高密度（路口拥堵，需协调）"
+  },
+  {
+    "name": "critical_a8_d0p15",
+    "num_agents": 8,
+    "traffic_density": 0.15,
+    "comment": "高压力：8车+中高密度（强制多车协作）"
+  },
+  {
+    "name": "occlusion_a4_d0p20",
+    "num_agents": 4,
+    "traffic_density": 0.20,
+    "comment": "遮挡场景：4车+高密度背景车（严重遮挡）"
+  },
+  {
+    "name": "occlusion_a6_d0p20",
+    "num_agents": 6,
+    "traffic_density": 0.20,
+    "comment": "遮挡场景：6车+高密度（Intent-GAT应显著优于LiDAR）"
+  },
+  {
+    "name": "occlusion_a8_d0p20",
+    "num_agents": 8,
+    "traffic_density": 0.20,
+    "comment": "极限遮挡：8车+高密度（通信能力的极限测试）"
+  },
+  {
+    "name": "chaos_a6_d0p25",
+    "num_agents": 6,
+    "traffic_density": 0.25,
+    "comment": "混乱场景：6车+极高密度（近乎拥堵）"
+  },
+  {
+    "name": "chaos_a8_d0p25",
+    "num_agents": 8,
+    "traffic_density": 0.25,
+    "comment": "混乱场景：8车+极高密度（baseline应崩溃）"
+  },
+  {
+    "name": "extreme_a10_d0p20",
+    "num_agents": 10,
+    "traffic_density": 0.20,
+    "comment": "极限测试：10车+高密度（测试通信可扩展性）"
+  },
+  {
+    "name": "extreme_a8_d0p30",
+    "num_agents": 8,
+    "traffic_density": 0.30,
+    "comment": "极限测试：8车+最高密度（终极压力测试）"
+  }
+]

@@ -1,0 +1,6 @@
+[
+  {"name": "pure_rl_2", "num_agents": 2, "traffic_density": 0.00},
+  {"name": "low_bg_2", "num_agents": 2, "traffic_density": 0.05},
+  {"name": "mid_bg_4", "num_agents": 4, "traffic_density": 0.10},
+  {"name": "high_bg_4", "num_agents": 4, "traffic_density": 0.25}
+]

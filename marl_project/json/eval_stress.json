@@ -1,0 +1,8 @@
+[
+  {"name": "hard_a4_d0p20",   "num_agents": 4, "traffic_density": 0.20},
+  {"name": "hard_a6_d0p20",   "num_agents": 6, "traffic_density": 0.20},
+  {"name": "stress_a4_d0p25", "num_agents": 4, "traffic_density": 0.25},
+  {"name": "stress_a6_d0p25", "num_agents": 6, "traffic_density": 0.25},
+  {"name": "hell_a4_d0p30",   "num_agents": 4, "traffic_density": 0.30},
+  {"name": "hell_a6_d0p30",   "num_agents": 6, "traffic_density": 0.30}
+]

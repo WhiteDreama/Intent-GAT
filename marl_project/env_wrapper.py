@@ -15,8 +15,19 @@ class GraphEnvWrapper(MultiAgentMetaDrive):
     def __init__(self, config=None):
         # Merge default config with user config
         meta_config = Config.get_metadrive_config()
+        comm_mode = "iid"
+        comm_burst_len = int(getattr(Config, "COMM_BURST_LEN", 1) or 1)
+        comm_stale_steps = int(getattr(Config, "COMM_STALE_STEPS", 0) or 0)
         if config:
+            comm_mode = str(config.get("comm_mode", comm_mode) or comm_mode)
+            comm_burst_len = int(config.get("comm_burst_len", comm_burst_len) or comm_burst_len)
+            comm_stale_steps = int(config.get("comm_stale_steps", comm_stale_steps) or comm_stale_steps)
             meta_config.update(config)
+
+        # Remove wrapper-only keys before passing config to MetaDrive core.
+        meta_config.pop("comm_mode", None)
+        meta_config.pop("comm_burst_len", None)
+        meta_config.pop("comm_stale_steps", None)
             
         super().__init__(meta_config)
         # Track previous actions for smoothing/reward shaping
@@ -27,10 +38,68 @@ class GraphEnvWrapper(MultiAgentMetaDrive):
         self._prev_lane_ids = {}
         # Track long-idle steps (deadlock) per agent
         self._idle_counts = {}
+        # Communication robustness semantics
+        self._comm_mode = str(comm_mode or "iid").lower()
+        self._comm_burst_len = max(1, int(comm_burst_len or 1))
+        self._comm_stale_steps = max(0, int(comm_stale_steps or 0))
+        self._comm_burst_remaining = {}
+        self._stale_neighbor_cache = {}
 
     @staticmethod
     def _wrap_to_pi(angle):
         return (angle + np.pi) % (2 * np.pi) - np.pi
+
+    @staticmethod
+    def _get_rel_denoms() -> tuple:
+        """Return (pos_denom, vel_denom) used for neighbor_rel_pos normalization."""
+        pos_denom = getattr(Config, "REL_POS_NORM_POS_DENOM", None)
+        if pos_denom is None:
+            pos_denom = float(getattr(Config, "COMM_RADIUS", 80.0))
+        pos_denom = max(1e-6, float(pos_denom))
+        vel_denom = max(1e-6, float(getattr(Config, "REL_POS_NORM_VEL_DENOM", 15.0)))
+        return pos_denom, vel_denom
+
+    @staticmethod
+    def _compute_neighbor_rel(
+        ego_pos,
+        ego_vel,
+        ego_heading: float,
+        n_pos,
+        n_vel,
+        *,
+        pos_denom: float,
+        vel_denom: float,
+        normalize: bool,
+    ):
+        """Compute ego-local (dx,dy,dvx,dvy) from world coords.
+
+        - ego-local frame: x forward, y left
+        - normalize=True: divide by pos_denom/vel_denom for model input stability
+        """
+        ego_pos = np.asarray(ego_pos, dtype=np.float32)
+        ego_vel = np.asarray(ego_vel, dtype=np.float32)
+        n_pos = np.asarray(n_pos, dtype=np.float32)
+        n_vel = np.asarray(n_vel, dtype=np.float32)
+
+        c, s = np.cos(float(ego_heading)), np.sin(float(ego_heading))
+        rel_pos = n_pos - ego_pos
+        local_x = float(rel_pos[0] * c + rel_pos[1] * s)
+        local_y = float(-rel_pos[0] * s + rel_pos[1] * c)
+        rel_vel = n_vel - ego_vel
+        local_vx = float(rel_vel[0] * c + rel_vel[1] * s)
+        local_vy = float(-rel_vel[0] * s + rel_vel[1] * c)
+
+        if normalize:
+            return [local_x / float(pos_denom), local_y / float(pos_denom), local_vx / float(vel_denom), local_vy / float(vel_denom)]
+        return [local_x, local_y, local_vx, local_vy]
+
+    @staticmethod
+    def _debug_graph_checks_enabled() -> bool:
+        return bool(getattr(Config, "DEBUG_GRAPH_CHECKS", False))
+
+    @staticmethod
+    def _debug_graph_eps() -> float:
+        return float(getattr(Config, "DEBUG_GRAPH_EPS", 1e-3))
 
     @staticmethod
     def _safe_speed_kmh(vehicle):
@@ -48,6 +117,96 @@ class GraphEnvWrapper(MultiAgentMetaDrive):
             except Exception:
                 pass
         return 0.0
+
+    def _prune_link_states(self, agent_id, neighbors_true):
+        nset = set(neighbors_true)
+        stale_keys = [k for k in self._stale_neighbor_cache.keys() if k[0] == agent_id and k[1] not in nset]
+        for k in stale_keys:
+            self._stale_neighbor_cache.pop(k, None)
+        burst_keys = [k for k in self._comm_burst_remaining.keys() if k[0] == agent_id and k[1] not in nset]
+        for k in burst_keys:
+            self._comm_burst_remaining.pop(k, None)
+
+    def _sample_link_drop(self, agent_id, neighbor_id, mask_ratio: float) -> bool:
+        """Return True if this link is dropped for current step under current communication mode."""
+        key = (agent_id, neighbor_id)
+        if self._comm_mode == "burst":
+            remaining = int(self._comm_burst_remaining.get(key, 0) or 0)
+            if remaining > 0:
+                self._comm_burst_remaining[key] = remaining - 1
+                return True
+            if np.random.random() < float(mask_ratio):
+                self._comm_burst_remaining[key] = max(0, int(self._comm_burst_len) - 1)
+                return True
+            return False
+        return bool(np.random.random() < float(mask_ratio))
+
+    def _build_masked_neighbors_and_rel(
+        self,
+        agent_id,
+        neighbors_true,
+        agent_positions,
+        agent_velocities,
+        ego_pos,
+        ego_vel,
+        ego_heading: float,
+        pos_denom: float,
+        vel_denom: float,
+    ):
+        mask_ratio = float(getattr(Config, "MASK_RATIO", 0.0) or 0.0)
+        masked_neighbors = []
+        neighbor_rel_pos = []
+        neighbor_rel_pos_true = []
+
+        self._prune_link_states(agent_id, neighbors_true)
+
+        for n_id in neighbors_true:
+            if n_id not in agent_positions:
+                continue
+
+            rel_true = self._compute_neighbor_rel(
+                ego_pos,
+                ego_vel,
+                ego_heading,
+                agent_positions[n_id],
+                agent_velocities[n_id],
+                pos_denom=pos_denom,
+                vel_denom=vel_denom,
+                normalize=False,
+            )
+            neighbor_rel_pos_true.append(rel_true)
+
+            link_drop = self._sample_link_drop(agent_id, n_id, mask_ratio)
+            cache_key = (agent_id, n_id)
+
+            if not link_drop:
+                rel_norm = self._compute_neighbor_rel(
+                    ego_pos,
+                    ego_vel,
+                    ego_heading,
+                    agent_positions[n_id],
+                    agent_velocities[n_id],
+                    pos_denom=pos_denom,
+                    vel_denom=vel_denom,
+                    normalize=True,
+                )
+                masked_neighbors.append(n_id)
+                neighbor_rel_pos.append(rel_norm)
+                if self._comm_mode == "staleness" and self._comm_stale_steps > 0:
+                    self._stale_neighbor_cache[cache_key] = {"rel": rel_norm, "age": 0}
+                continue
+
+            if self._comm_mode == "staleness" and self._comm_stale_steps > 0:
+                cached = self._stale_neighbor_cache.get(cache_key)
+                if isinstance(cached, dict):
+                    cached_age = int(cached.get("age", 0) or 0)
+                    if cached_age < self._comm_stale_steps:
+                        rel_cached = list(cached.get("rel", [0.0, 0.0, 0.0, 0.0]))
+                        masked_neighbors.append(n_id)
+                        neighbor_rel_pos.append(rel_cached)
+                        cached["age"] = cached_age + 1
+
+        return masked_neighbors, neighbor_rel_pos, neighbor_rel_pos_true
 
     def _lane_metrics(self, vehicle):
         """Return (abs_lat, heading_err_rad, long, lane_id) or (None, None, None, None) if unavailable."""
@@ -82,6 +241,170 @@ class GraphEnvWrapper(MultiAgentMetaDrive):
             return abs_lat, heading_err, float(long), lane_id
         except Exception:
             return None, None, None, None
+
+    def _get_spawn_manager(self):
+        """Best-effort locate SpawnManager across MetaDrive versions.
+
+        Some versions expose it as engine.spawn_manager, others nest it under
+        engine.agent_manager.spawn_manager.
+        """
+        eng = getattr(self, "engine", None)
+        if eng is None:
+            return None
+        sm = getattr(eng, "spawn_manager", None)
+        if sm is not None:
+            return sm
+        am = getattr(eng, "agent_manager", None)
+        sm = getattr(am, "spawn_manager", None) if am is not None else None
+        return sm
+
+    def _debug_spawn_capacity_after_reset(self, *, tag: str = "reset") -> dict:
+        """Collect + optionally print spawn capacity diagnostics.
+
+        Returns a dict with computed fields for reuse in error messages.
+        """
+        sm = self._get_spawn_manager()
+        eng = getattr(self, "engine", None)
+        gcfg = getattr(eng, "global_config", {}) if eng is not None else {}
+
+        def _cfg_get(cfg, key, default=None):
+            try:
+                if hasattr(cfg, "get"):
+                    return cfg.get(key, default)
+            except Exception:
+                pass
+            return default
+
+        map_cfg = _cfg_get(gcfg, "map_config", {})
+        map_mode = str(getattr(Config, "MAP_MODE", "block_num"))
+        info = {
+            "tag": str(tag),
+            "map_mode": map_mode,
+            "map_type": (str(getattr(Config, "MAP_TYPE", "")) if map_mode == "block_sequence" else ""),
+            "block_num": (int(getattr(Config, "MAP_BLOCK_NUM", 0)) if map_mode == "block_num" else None),
+            "lane_num": _cfg_get(map_cfg, "lane_num", None),
+            "exit_length": _cfg_get(map_cfg, "exit_length", None),
+            "spawn_roads_cfg": _cfg_get(gcfg, "spawn_roads", None),
+            "num_agents_cfg": _cfg_get(gcfg, "num_agents", None),
+        }
+
+        if sm is None:
+            info["error"] = "spawn_manager_not_found"
+            return info
+
+        spawn_roads = getattr(sm, "spawn_roads", None)
+        if spawn_roads is None:
+            spawn_roads = []
+        try:
+            spawn_roads = list(spawn_roads)
+        except Exception:
+            spawn_roads = [spawn_roads]
+
+        # Infer slot count from SpawnManager logic
+        try:
+            exit_length = float(getattr(sm, "exit_length"))
+            respawn_long = float(getattr(sm, "RESPAWN_REGION_LONGITUDE"))
+            num_slots = int(np.floor(exit_length / max(1e-6, respawn_long)))
+        except Exception:
+            exit_length, respawn_long, num_slots = None, None, None
+
+        lane_num = info.get("lane_num")
+        try:
+            if lane_num is None:
+                lane_num = int(getattr(sm, "lane_num"))
+        except Exception:
+            pass
+
+        capacity = None
+        if lane_num is not None and num_slots is not None:
+            capacity = int(lane_num) * int(len(spawn_roads)) * int(max(0, num_slots))
+
+        # Spawn lanes: approximate by counting unique spawn_lane_index in configs
+        spawn_lane_count = None
+        try:
+            cfgs = getattr(sm, "available_agent_configs", None)
+            if cfgs is not None:
+                lane_set = set()
+                for c in cfgs:
+                    try:
+                        lane_idx = c["config"]["spawn_lane_index"]
+                        lane_set.add(tuple(lane_idx))
+                    except Exception:
+                        continue
+                spawn_lane_count = len(lane_set)
+        except Exception:
+            pass
+
+        road_ids = []
+        for r in spawn_roads:
+            try:
+                road_ids.append(f"{getattr(r, 'start_node', '?')}->{getattr(r, 'end_node', '?')}")
+            except Exception:
+                road_ids.append(str(r))
+
+        # Prefer exit_length from map_config for reporting reproducibility
+        if info.get("exit_length") is None:
+            info["exit_length"] = exit_length
+
+        info.update(
+            {
+                "len_spawn_roads": int(len(spawn_roads)),
+                "spawn_roads": road_ids,
+                "spawn_lane_count": spawn_lane_count,
+                "lane_num": lane_num,
+                "exit_length_internal": exit_length,
+                "respawn_region_longitude": respawn_long,
+                "num_slots": num_slots,
+                "capacity": capacity,
+            }
+        )
+
+        # One-line summary (paper-friendly): only print when debug enabled or on failure.
+        def _summary_line() -> str:
+            mm = info.get("map_mode")
+            mt = info.get("map_type")
+            bn = info.get("block_num")
+            ln = info.get("lane_num")
+            el = info.get("exit_length")
+            na = info.get("num_agents_cfg")
+            sr = info.get("len_spawn_roads")
+            ns = info.get("num_slots")
+            cap = info.get("capacity")
+            return (
+                f"[SpawnCapacity:{tag}] map_mode={mm} map_type={mt} block_num={bn} "
+                f"lane_num={ln} exit_length={el} num_agents={na} spawn_roads={sr} "
+                f"num_slots={ns} capacity={cap}"
+            )
+
+        should_print = bool(getattr(Config, "DEBUG_SPAWN_ON_RESET", False))
+        if should_print:
+            print(_summary_line())
+            print(f"[SpawnDebug:{tag}] spawn_roads={road_ids}")
+
+        # Strict safety check: fail fast if capacity is insufficient.
+        strict = bool(getattr(Config, "STRICT_SPAWN_CAPACITY", True))
+        try:
+            num_agents = int(info.get("num_agents_cfg") or 0)
+        except Exception:
+            num_agents = 0
+
+        if strict and capacity is not None and num_agents > 0 and capacity < num_agents:
+            # Always print one-line summary + details on failure.
+            print(_summary_line())
+            print(
+                f"[SpawnDebug:{tag}] ERROR: capacity({capacity}) < num_agents({num_agents}). "
+                "Refusing to continue (to avoid sampling spawn slots with replacement)."
+            )
+            print(f"[SpawnDebug:{tag}] spawn_roads={road_ids}")
+            raise RuntimeError(
+                "Spawn capacity insufficient for num_agents. "
+                f"capacity={capacity}, num_agents={num_agents}, lane_num={lane_num}, "
+                f"num_slots={num_slots}, len_spawn_roads={len(spawn_roads)}, "
+                f"exit_length={info.get('exit_length')}, respawn_region_longitude={respawn_long}, "
+                f"spawn_roads_cfg={info.get('spawn_roads_cfg')}"
+            )
+
+        return info
         
     def step(self, actions):
         """
@@ -164,52 +487,73 @@ class GraphEnvWrapper(MultiAgentMetaDrive):
             noisy_obs[lidar_start_idx:] = np.clip(noisy_obs[lidar_start_idx:], 0.0, 1.0)
             
             # --- Topology: Graph Construction ---
-            neighbors = self._get_neighbors(agent_id, agent_positions)
-            
-            # --- Sim-to-Real: Packet Loss ---
-            # Randomly mask neighbors
-            masked_neighbors = []
-            for n_id in neighbors:
-                if np.random.random() > Config.MASK_RATIO:
-                    masked_neighbors.append(n_id)
-            
+            # Define a deterministic neighbor set: nearest top-K within COMM_RADIUS.
+            # Communication perturbation semantics are applied after top-K selection.
+            neighbors_true = self._get_neighbors_within_radius_sorted(agent_id, agent_positions)
+            K = int(getattr(Config, "MAX_NEIGHBORS", 0) or 0)
+            if K < 0:
+                K = 0
+            neighbors_true = neighbors_true[:K] if K > 0 else []
+
             # Calculate relative positions and velocities for GAT
+            masked_neighbors = []
             neighbor_rel_pos = []
             neighbor_rel_pos_true = []
             if agent_id in self.agents:
                 ego_pos = self.agents[agent_id].position
                 ego_vel = self.agents[agent_id].velocity
-                ego_heading = self.agents[agent_id].heading_theta
-                c, s = np.cos(ego_heading), np.sin(ego_heading)
+                ego_heading = float(self.agents[agent_id].heading_theta)
+                pos_denom, vel_denom = self._get_rel_denoms()
+                masked_neighbors, neighbor_rel_pos, neighbor_rel_pos_true = self._build_masked_neighbors_and_rel(
+                    agent_id,
+                    neighbors_true,
+                    agent_positions,
+                    agent_velocities,
+                    ego_pos,
+                    ego_vel,
+                    ego_heading,
+                    pos_denom,
+                    vel_denom,
+                )
 
-                # True rel pos (no packet loss) for reward/safety/event stats
-                for n_id in neighbors:
-                    n_pos = agent_positions[n_id]
-                    n_vel = agent_velocities[n_id]
-                    rel_pos = n_pos - ego_pos
-                    local_x = rel_pos[0] * c + rel_pos[1] * s
-                    local_y = -rel_pos[0] * s + rel_pos[1] * c
-                    rel_vel = n_vel - ego_vel
-                    local_vx = rel_vel[0] * c + rel_vel[1] * s
-                    local_vy = -rel_vel[0] * s + rel_vel[1] * c
-                    neighbor_rel_pos_true.append([local_x, local_y, local_vx, local_vy])
-
-                # Masked rel pos for observation
-                for n_id in masked_neighbors:
-                    n_pos = agent_positions[n_id]
-                    n_vel = agent_velocities[n_id]
-                    rel_pos = n_pos - ego_pos
-                    local_x = rel_pos[0] * c + rel_pos[1] * s
-                    local_y = -rel_pos[0] * s + rel_pos[1] * c
-                    rel_vel = n_vel - ego_vel
-                    local_vx = rel_vel[0] * c + rel_vel[1] * s
-                    local_vy = -rel_vel[0] * s + rel_vel[1] * c
-                    neighbor_rel_pos.append([local_x, local_y, local_vx, local_vy])
+                # Optional sanity checks (debug only)
+                if self._debug_graph_checks_enabled():
+                    eps = self._debug_graph_eps()
+                    assert len(masked_neighbors) == len(neighbor_rel_pos)
+                    assert len(neighbors_true) == len(neighbor_rel_pos_true)
+                    assert len(neighbors_true) <= K
+                    if neighbors_true:
+                        n0 = neighbors_true[0]
+                        recompute = self._compute_neighbor_rel(
+                            ego_pos,
+                            ego_vel,
+                            ego_heading,
+                            agent_positions[n0],
+                            agent_velocities[n0],
+                            pos_denom=pos_denom,
+                            vel_denom=vel_denom,
+                            normalize=False,
+                        )
+                        diff = np.max(np.abs(np.asarray(recompute, dtype=np.float32) - np.asarray(neighbor_rel_pos_true[0], dtype=np.float32)))
+                        assert float(diff) <= float(eps)
+                    if masked_neighbors:
+                        n1 = masked_neighbors[0]
+                        recompute = self._compute_neighbor_rel(
+                            ego_pos,
+                            ego_vel,
+                            ego_heading,
+                            agent_positions[n1],
+                            agent_velocities[n1],
+                            pos_denom=pos_denom,
+                            vel_denom=vel_denom,
+                            normalize=True,
+                        )
+                        diff = np.max(np.abs(np.asarray(recompute, dtype=np.float32) - np.asarray(neighbor_rel_pos[0], dtype=np.float32)))
+                        assert float(diff) <= float(eps)
             else:
-                # Fallback if agent not found (e.g. done state)
                 for _ in masked_neighbors:
                     neighbor_rel_pos.append([0.0, 0.0, 0.0, 0.0])
-                for _ in neighbors:
+                for _ in neighbors_true:
                     neighbor_rel_pos_true.append([0.0, 0.0, 0.0, 0.0])
             
             # --- Auxiliary Task: Ground Truth Waypoints ---
@@ -217,9 +561,10 @@ class GraphEnvWrapper(MultiAgentMetaDrive):
             
             processed_obs[agent_id] = {
                 "node_features": noisy_obs,
-                "neighbors": masked_neighbors, # List of agent_ids
-                "neighbor_rel_pos": neighbor_rel_pos, # List of [x, y, vx, vy]
-                "neighbor_rel_pos_true": neighbor_rel_pos_true, # reward/safety only (no packet loss)
+                "neighbors": masked_neighbors, # effective neighbors after packet loss (ordered)
+                "neighbors_true": neighbors_true, # top-K neighbors before packet loss (ordered)
+                "neighbor_rel_pos": neighbor_rel_pos, # normalized, aligned with `neighbors`
+                "neighbor_rel_pos_true": neighbor_rel_pos_true, # unnormalized, aligned with `neighbors_true`
                 "gt_waypoints": gt_waypoints,   # Shape (PRED_WAYPOINTS_NUM, 2)
                 "raw_position": agent_positions[agent_id], # Useful for visualization/debugging
                 "agent_id": agent_id # Explicitly track agent_id
@@ -519,6 +864,23 @@ class GraphEnvWrapper(MultiAgentMetaDrive):
             if heading_err is not None:
                 infos[agent_id]["heading_err_rad"] = float(heading_err)
 
+            # === [新增] 交互强度指标 (Interaction Intensity Metrics) ===
+            # 用于论文分析：量化场景的交互复杂度
+            has_neighbor = len(processed_obs[agent_id].get("neighbors_true", [])) > 0
+            infos[agent_id]["has_neighbor"] = int(has_neighbor)
+            infos[agent_id]["num_neighbors"] = len(processed_obs[agent_id].get("neighbors_true", []))
+            
+            # Near-Miss事件：高风险交互（用于安全性分析）
+            near_miss = (
+                (min_ttc is not None and min_ttc < 2.0) or 
+                (min_dist is not None and min_dist < 5.0)
+            )
+            infos[agent_id]["near_miss"] = int(near_miss)
+            
+            # 停车状态：低效率指标（用于效率分析）
+            is_stopped = speed_kmh < 1.0
+            infos[agent_id]["is_stopped"] = int(is_stopped)
+
             # Unified event signals for downstream aggregation
             ttc_thr = float(getattr(Config, "TTC_THRESHOLD_S", 2.5))
             safety_dist = float(getattr(Config, "SAFETY_DIST", 8.0))
@@ -556,24 +918,36 @@ class GraphEnvWrapper(MultiAgentMetaDrive):
         return processed_obs, rewards, merged_dones, infos
 
     def _get_neighbors(self, agent_id, all_positions):
+        """DEPRECATED: kept for backward compatibility.
+
+        Use _get_neighbors_within_radius_sorted() + top-K slicing instead.
         """
-        Find neighbors within COMM_RADIUS.
+        return self._get_neighbors_within_radius_sorted(agent_id, all_positions)
+
+    def _get_neighbors_within_radius_sorted(self, agent_id, all_positions):
+        """Return neighbors within COMM_RADIUS, sorted by (distance, tie-break).
+
+        Tie-break uses str(agent_id) to guarantee deterministic ordering.
         """
-        my_pos = all_positions[agent_id]
-        neighbors = []
-        
+        if agent_id not in all_positions:
+            return []
+        my_pos = np.asarray(all_positions[agent_id], dtype=np.float32)
+        comm_r = float(getattr(Config, "COMM_RADIUS", 80.0))
+        comm_r = max(0.0, comm_r)
+
+        candidates = []
         for other_id, other_pos in all_positions.items():
             if agent_id == other_id:
                 continue
-                
-            dist = np.linalg.norm(my_pos - other_pos)
-            if dist < Config.COMM_RADIUS:
-                neighbors.append(other_id)
-                
-        # Sort by distance (optional, but good for consistent input if we truncate)
-        # For now, we just return all valid neighbors. 
-        # The GAT module will handle padding/truncation to MAX_NEIGHBORS.
-        return neighbors
+            try:
+                dist = float(np.linalg.norm(my_pos - np.asarray(other_pos, dtype=np.float32)))
+            except Exception:
+                continue
+            if dist < comm_r:
+                candidates.append((dist, str(other_id), other_id))
+
+        candidates.sort(key=lambda x: (x[0], x[1]))
+        return [oid for _, __, oid in candidates]
 
     def _get_future_waypoints(self, agent_id):
         """
@@ -583,32 +957,72 @@ class GraphEnvWrapper(MultiAgentMetaDrive):
             return np.zeros((Config.PRED_WAYPOINTS_NUM, 2), dtype=np.float32)
             
         vehicle = self.agents[agent_id]
-        
-        # Robust implementation using current lane
+
+        # Use navigation reference lanes so GT follows planned route through intersections.
+        # Fallback to vehicle.lane if navigation is not ready.
+        navi = getattr(vehicle, "navigation", None)
+        ref_lanes = None
+        next_ref_lanes = None
+        if navi is not None:
+            ref_lanes = getattr(navi, "current_ref_lanes", None)
+            next_ref_lanes = getattr(navi, "next_ref_lanes", None)
+
+        lanes_seq = []
+        if isinstance(ref_lanes, (list, tuple)) and len(ref_lanes) > 0:
+            # Prefer the actual lane if it is one of the reference lanes
+            if getattr(vehicle, "lane", None) in ref_lanes:
+                lanes_seq.append(vehicle.lane)
+            else:
+                lanes_seq.append(ref_lanes[0])
+        elif getattr(vehicle, "lane", None) is not None:
+            lanes_seq.append(vehicle.lane)
+
+        if isinstance(next_ref_lanes, (list, tuple)) and len(next_ref_lanes) > 0:
+            # Only need the next segment for short-horizon waypoints.
+            lanes_seq.append(next_ref_lanes[0])
+
+        if len(lanes_seq) == 0:
+            return np.zeros((Config.PRED_WAYPOINTS_NUM, 2), dtype=np.float32)
+
+        base_lane = lanes_seq[0]
+        try:
+            long0, _ = base_lane.local_coordinates(vehicle.position)
+        except Exception:
+            long0 = 0.0
+        long0 = float(np.clip(long0, 0.0, float(getattr(base_lane, "length", 0.0) or 0.0)))
+
+        step_dist = float(getattr(Config, "WAYPOINT_STEP_DIST", 5.0))
         future_points = []
-        current_lane = vehicle.lane
-        
-        # Get current longitudinal position
-        long, lat = current_lane.local_coordinates(vehicle.position)
-        
-        for i in range(1, Config.PRED_WAYPOINTS_NUM + 1):
-            look_ahead_dist = i * 5.0 
-            target_long = long + look_ahead_dist
-            
-            # Get point on lane
-            point = current_lane.position(target_long, 0)
-            
-            # Transform to ego coordinates
+        heading = float(getattr(vehicle, "heading_theta", 0.0))
+        c, s = np.cos(heading), np.sin(heading)
+
+        for i in range(1, int(getattr(Config, "PRED_WAYPOINTS_NUM", 5)) + 1):
+            look_ahead = float(i) * step_dist
+
+            lane = lanes_seq[0]
+            lane_long = long0 + look_ahead
+            lane_len = float(getattr(lane, "length", 0.0) or 0.0)
+
+            if lane_long > lane_len and len(lanes_seq) > 1:
+                # Spill over to next lane
+                remain = lane_long - lane_len
+                lane = lanes_seq[1]
+                lane_len = float(getattr(lane, "length", 0.0) or 0.0)
+                lane_long = float(np.clip(remain, 0.0, lane_len))
+            else:
+                lane_long = float(np.clip(lane_long, 0.0, lane_len))
+
+            try:
+                point = lane.position(lane_long, 0)
+            except Exception:
+                # As a final fallback, reuse current position
+                point = np.asarray(vehicle.position, dtype=np.float32)
+
             rel_pos = point - vehicle.position
-            heading = vehicle.heading_theta
-            c, s = np.cos(heading), np.sin(heading)
-            
-            # Rotate by -heading
-            local_x = rel_pos[0] * c + rel_pos[1] * s
-            local_y = -rel_pos[0] * s + rel_pos[1] * c
-            
+            local_x = float(rel_pos[0] * c + rel_pos[1] * s)
+            local_y = float(-rel_pos[0] * s + rel_pos[1] * c)
             future_points.append([local_x, local_y])
-            
+
         return np.array(future_points, dtype=np.float32)
 
     def update_config_params(self, params: dict):
@@ -624,11 +1038,17 @@ class GraphEnvWrapper(MultiAgentMetaDrive):
 
     def reset(self, *args, **kwargs):
         obs, info = super().reset(*args, **kwargs)
-    # Clear episode states
+
+        # Spawn debug/safety check (right after env.reset)
+        self._debug_spawn_capacity_after_reset(tag="reset")
+
+        # Clear episode states
         self.prev_actions = {}
         self._idle_counts = {}
         self._prev_longs = {}
         self._prev_lane_ids = {}
+        self._comm_burst_remaining = {}
+        self._stale_neighbor_cache = {}
         
         processed_obs = {}
         agent_positions = {}
@@ -648,44 +1068,82 @@ class GraphEnvWrapper(MultiAgentMetaDrive):
             noisy_obs[lidar_start_idx:] += noise
             noisy_obs[lidar_start_idx:] = np.clip(noisy_obs[lidar_start_idx:], 0.0, 1.0)
             
-            neighbors = self._get_neighbors(agent_id, agent_positions)
+            neighbors_true = self._get_neighbors_within_radius_sorted(agent_id, agent_positions)
+            K = int(getattr(Config, "MAX_NEIGHBORS", 0) or 0)
+            if K < 0:
+                K = 0
+            neighbors_true = neighbors_true[:K] if K > 0 else []
+
             masked_neighbors = []
-            for n_id in neighbors:
-                if np.random.random() > Config.MASK_RATIO:
-                    masked_neighbors.append(n_id)
-            
             neighbor_rel_pos = []
+            neighbor_rel_pos_true = []
             if agent_id in self.agents:
                 ego_pos = self.agents[agent_id].position
                 ego_vel = self.agents[agent_id].velocity
-                ego_heading = self.agents[agent_id].heading_theta
-                c, s = np.cos(ego_heading), np.sin(ego_heading)
-                
-                for n_id in masked_neighbors:
-                    n_pos = agent_positions[n_id]
-                    n_vel = agent_velocities[n_id]
-                    
-                    rel_pos = n_pos - ego_pos
-                    local_x = rel_pos[0] * c + rel_pos[1] * s
-                    local_y = -rel_pos[0] * s + rel_pos[1] * c
-                    
-                    rel_vel = n_vel - ego_vel
-                    local_vx = rel_vel[0] * c + rel_vel[1] * s
-                    local_vy = -rel_vel[0] * s + rel_vel[1] * c
-                    
-                    neighbor_rel_pos.append([local_x, local_y, local_vx, local_vy])
+                ego_heading = float(self.agents[agent_id].heading_theta)
+                pos_denom, vel_denom = self._get_rel_denoms()
+                masked_neighbors, neighbor_rel_pos, neighbor_rel_pos_true = self._build_masked_neighbors_and_rel(
+                    agent_id,
+                    neighbors_true,
+                    agent_positions,
+                    agent_velocities,
+                    ego_pos,
+                    ego_vel,
+                    ego_heading,
+                    pos_denom,
+                    vel_denom,
+                )
+
+                if self._debug_graph_checks_enabled():
+                    eps = self._debug_graph_eps()
+                    assert len(masked_neighbors) == len(neighbor_rel_pos)
+                    assert len(neighbors_true) == len(neighbor_rel_pos_true)
+                    assert len(neighbors_true) <= K
+                    if neighbors_true:
+                        n0 = neighbors_true[0]
+                        recompute = self._compute_neighbor_rel(
+                            ego_pos,
+                            ego_vel,
+                            ego_heading,
+                            agent_positions[n0],
+                            agent_velocities[n0],
+                            pos_denom=pos_denom,
+                            vel_denom=vel_denom,
+                            normalize=False,
+                        )
+                        diff = np.max(np.abs(np.asarray(recompute, dtype=np.float32) - np.asarray(neighbor_rel_pos_true[0], dtype=np.float32)))
+                        assert float(diff) <= float(eps)
+                    if masked_neighbors:
+                        n1 = masked_neighbors[0]
+                        recompute = self._compute_neighbor_rel(
+                            ego_pos,
+                            ego_vel,
+                            ego_heading,
+                            agent_positions[n1],
+                            agent_velocities[n1],
+                            pos_denom=pos_denom,
+                            vel_denom=vel_denom,
+                            normalize=True,
+                        )
+                        diff = np.max(np.abs(np.asarray(recompute, dtype=np.float32) - np.asarray(neighbor_rel_pos[0], dtype=np.float32)))
+                        assert float(diff) <= float(eps)
             else:
                 for _ in masked_neighbors:
                     neighbor_rel_pos.append([0.0, 0.0, 0.0, 0.0])
+                for _ in neighbors_true:
+                    neighbor_rel_pos_true.append([0.0, 0.0, 0.0, 0.0])
 
             gt_waypoints = self._get_future_waypoints(agent_id)
             
             processed_obs[agent_id] = {
                 "node_features": noisy_obs,
                 "neighbors": masked_neighbors,
+                "neighbors_true": neighbors_true,
                 "neighbor_rel_pos": neighbor_rel_pos,
+                "neighbor_rel_pos_true": neighbor_rel_pos_true,
                 "gt_waypoints": gt_waypoints,
-                "raw_position": agent_positions[agent_id]
+                "raw_position": agent_positions[agent_id],
+                "agent_id": agent_id,
             }
             
         # Gymnasium reset returns (obs, info); SB3 SubprocVecEnv expects that. Keep signature aligned.

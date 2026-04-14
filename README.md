@@ -1,159 +1,126 @@
-<br>
+[English Version](README_EN.md)
 
-![](documentation/source/figs/logo-horizon.png)
+# Cooperative MARL Driving on MetaDrive
 
-<br>
+基于 MetaDrive 的多智能体协同驾驶实验仓库，聚焦通信受限条件下的协同决策、鲁棒性评估与混合交通测试。核心研究代码位于 `marl_project/`，底层模拟器源码位于 `metadrive/`。
 
-# MetaDrive: an Open-source Driving Simulator for AI and Autonomy Research
+## 项目预览
 
-[![build](https://github.com/metadriverse/metadrive/workflows/test/badge.svg)](http://github.com/metadriverse/metadrive/actions)
-[![Documentation](https://readthedocs.org/projects/metadrive-simulator/badge/?version=latest)](https://metadrive-simulator.readthedocs.io)
-[![GitHub license](https://img.shields.io/github/license/metadriverse/metadrive)](https://github.com/metadriverse/metadrive/blob/main/LICENSE.txt)
-[![GitHub contributors](https://img.shields.io/github/contributors/metadriverse/metadrive)](https://github.com/metadriverse/metadrive/graphs/contributors)
-[![Downloads](https://static.pepy.tech/badge/MetaDrive-simulator)](https://pepy.tech/project/MetaDrive-simulator)
+![Project Preview](fig/image.png)
 
-<div style="text-align: center; width:100%; margin: 0 auto; display: inline-block">
-<strong>
-[
-<a href="https://metadrive-simulator.readthedocs.io">Documentation</a>
-|
-<a href="https://github.com/metadriverse/metadrive?tab=readme-ov-file#-examples">Colab Examples</a>
-|
-<a href="https://www.youtube.com/embed/3ziJPqC_-T4">Demo Video</a>
-|
-<a href="https://metadriverse.github.io/metadrive-simulator/">Website</a>
-|
-<a href="https://arxiv.org/pdf/2109.12674.pdf">Paper</a>
-|
-<a href="https://metadriverse.github.io/">Relevant Projects</a>
-]
-</strong>
-</div>
+## 项目内容
 
-<br>
+- 基于图通信的多智能体协同驾驶训练与评估
+- 支持多种对比模式：`ours`、`no_comm`、`no_aux`、`lidar_only`、`oracle`、`tarmac`、`mappo`、`mappo_ips`、`where2comm`
+- 支持通信丢包、观测噪声、地图切换、混合交通渗透率 sweep
+- 支持批量 checkpoint 评估、失败案例导出、可视化渲染与推理开销 benchmark
 
-MetaDrive is a driving simulator with the following key features:
+## 仓库结构
 
-- **Compositional**: It supports synthesising infinite scenes with various road maps and traffic settings or loading real-world driving logs for the research of generalizable RL. 
-- **Lightweight**: It is easy to install and run on Linux/Windows/MacOS with sensor simulation support. It can run up to +1000 FPS on a standard PC.
-- **Realistic**: Accurate physics simulation and multiple sensory input including point cloud, RGB/Depth/Semantic images, top-down semantic map and first-person view images. 
+- `marl_project/train.py`：训练入口
+- `marl_project/evaluate.py`：评估、鲁棒性测试与可视化入口
+- `marl_project/benchmark_inference.py`：推理延迟、通信负载、参数量 benchmark
+- `marl_project/config.py`：主实验配置
+- `marl_project/config_tarmac.py`：TarMAC 对齐配置
+- `marl_project/json/`：评估 sweep 配置
+- `logs/marl_experiment/`：训练日志与 checkpoint 输出目录
 
+## 环境准备
 
-## 🛠 Quick Start
-Install MetaDrive via:
+推荐在仓库根目录执行以下命令。
+
+### 方式一：使用环境文件
 
 ```bash
-git clone https://github.com/metadriverse/metadrive.git
-cd metadrive
+conda env create -f metadrive_env.yml
+conda activate metadrive
 pip install -e .
 ```
 
-You can verify the installation of MetaDrive via running the testing script:
+### 方式二：使用 pip
 
 ```bash
-# Go to a folder where no sub-folder calls metadrive
-python -m metadrive.examples.profile_metadrive
+pip install -r requirements.txt
+pip install -e .
 ```
 
-*Note that please do not run the above command in a folder that has a sub-folder called `./metadrive`.*
+## `marl_project` 快速使用
 
-## 🚕 Examples
-We provide [examples](https://github.com/metadriverse/metadrive/tree/main/metadrive/examples) to demonstrate features and basic usages of MetaDrive after the local installation.
-There is an `.ipynb` example which can be directly opened in Colab. [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/metadriverse/metadrive/blob/main/metadrive/examples/Basic_MetaDrive_Usages.ipynb)
+### 1. 训练模型
 
-Also, you can try examples in the documentation directly in Colab! See more details in [Documentations](#-documentations).
-
-### Single Agent Environment
-Run the following command to launch a simple driving scenario with auto-drive mode on. Press W, A, S, D to drive the vehicle manually.
-```bash
-python -m metadrive.examples.drive_in_single_agent_env
-```
-Run the following command to launch a safe driving scenario, which includes more complex obstacles and cost to be yielded. 
+从仓库根目录启动训练：
 
 ```bash
-python -m metadrive.examples.drive_in_safe_metadrive_env
+python marl_project/train.py --exp_name baseline_intent_gat --experiment_mode ours --device cuda:0
 ```
 
-### Multi-Agent Environment
+常用 `--experiment_mode`：
 
-You can also launch an instance of Multi-Agent scenario as follows
+- `ours`
+- `no_comm`
+- `no_aux`
+- `lidar_only`
+- `oracle`
+- `tarmac`
+- `mappo`
+- `mappo_ips`
+- `where2comm`
+
+### 2. 查看训练输出
+
+训练结果默认保存在 `logs/marl_experiment/<exp_name>/`，常见文件包括：
+
+- `best_model.pth`
+- `best_success_model.pth`
+- `ckpt_*.pth`
+- `hparams.json`
+
+通常推荐优先使用 `best_success_model.pth` 做后续评估。
+
+### 3. 评估单个 checkpoint
 
 ```bash
-python -m metadrive.examples.drive_in_multi_agent_env --env roundabout
+python marl_project/evaluate.py --model_path logs/marl_experiment/baseline_intent_gat/best_success_model.pth --model_type ours --episodes 20 --save_json logs/eval_ours.json
 ```
-```--env```  accepts following parmeters: `roundabout` (default), `intersection`, `tollgate`, `bottleneck`, `parkinglot`, `pgmap`.
-Adding ```--top_down``` can launch top-down pygame renderer. 
 
-
-
-
-### Real Environment
-Running the following script enables driving in a scenario constructed from nuScenes dataset or Waymo dataset.
+### 4. 进行混合交通压力测试
 
 ```bash
-python -m metadrive.examples.drive_in_real_env
+python marl_project/evaluate.py --model_path logs/marl_experiment/baseline_intent_gat/best_success_model.pth --model_type ours --mpr_sweep marl_project/json/eval_stress.json --episodes 20 --save_json logs/eval_stress.json
 ```
 
-The default real-world dataset is nuScenes.
-Use ```--waymo``` to visualize Waymo scenarios.
-Traffic vehicles can not response to surrounding vchicles if directly replaying them.
-Add argument ```--reactive_traffic``` to use an IDM policy control them and make them reactive.
-Press key ```r``` for loading a new scenario, and ```b``` or ```q``` for switching perspective. 
+### 5. 做通信鲁棒性测试
 
-
-
-### Basic Usage
-To build the RL environment in python script, you can simply code in the Farama Gymnasium format as:
-
-```python
-from metadrive.envs.metadrive_env import MetaDriveEnv
-
-env = MetaDriveEnv(config={"use_render": True})
-obs, info = env.reset()
-for i in range(1000):
-    obs, reward, terminated, truncated, info = env.step(env.action_space.sample())
-    if terminated or truncated:
-        env.reset()
-env.close()
+```bash
+python marl_project/evaluate.py --model_path logs/marl_experiment/baseline_intent_gat/best_success_model.pth --model_type ours --mask 0.10 --episodes 20 --save_json logs/eval_mask_0.10.json
 ```
 
+### 6. 可视化渲染模型行为
 
-## 🏫 Documentations
-
-Please find more details in: https://metadrive-simulator.readthedocs.io
-
-### Running Examples in Doc
-The documentation is built with `.ipynb` so every example can run locally
-or with colab. For Colab running, on the Colab interface, click “GitHub,” enter the URL of MetaDrive:
-https://github.com/metadriverse/metadrive, and hit the search icon.
-After running examples, you are expected to get the same output and visualization results as the documentation!
-
-For example, hitting the following icon opens the source `.ipynb` file of the documentation section: [Environments](https://metadrive-simulator.readthedocs.io/en/latest/rl_environments.html).
-
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/metadriverse/metadrive/blob/main/documentation/source/rl_environments.ipynb)
-
-## 📎 References
-
-If you use MetaDrive in your own work, please cite:
-
-```latex
-@article{li2022metadrive,
-  title={Metadrive: Composing diverse driving scenarios for generalizable reinforcement learning},
-  author={Li, Quanyi and Peng, Zhenghao and Feng, Lan and Zhang, Qihang and Xue, Zhenghai and Zhou, Bolei},
-  journal={IEEE Transactions on Pattern Analysis and Machine Intelligence},
-  year={2022}
-}
+```bash
+python marl_project/evaluate.py --model_path logs/marl_experiment/baseline_intent_gat/best_success_model.pth --model_type ours --episodes 3 --render --top_down --pause_at_end
 ```
 
+### 7. 统计推理开销
 
-## Acknowledgement
+```bash
+python -m marl_project.benchmark_inference
+```
 
-The simulator can not be built without the help from Panda3D community and the following open-sourced projects:
-- panda3d-simplepbr: https://github.com/Moguri/panda3d-simplepbr
-- panda3d-gltf: https://github.com/Moguri/panda3d-gltf
-- RenderPipeline (RP): https://github.com/tobspr/RenderPipeline
-- Water effect for RP: https://github.com/kergalym/RenderPipeline 
-- procedural_panda3d_model_primitives: https://github.com/Epihaius/procedural_panda3d_model_primitives
-- DiamondSquare for terrain generation: https://github.com/buckinha/DiamondSquare
-- KITSUNETSUKI-Asset-Tools: https://github.com/kitsune-ONE-team/KITSUNETSUKI-Asset-Tools
+该脚本会输出不同方法的单步推理延迟、通信负载与参数量，并将结果保存到 `logs/eval_compare/inference_cost.csv`。
 
+## 配置入口
+
+如果你想快速调整实验设置，优先查看 `marl_project/config.py`。常改参数包括：
+
+- `NUM_AGENTS`
+- `MAP_MODE` / `MAP_BLOCK_NUM` / `MAP_TYPE`
+- `LR` / `BATCH_SIZE` / `PPO_EPOCHS`
+- `COMM_RADIUS` / `MASK_RATIO` / `NOISE_STD`
+- `EXPERIMENT_MODE`
+
+## 说明
+
+- 所有命令默认从仓库根目录执行
+- `marl_project` 是本项目的主要实验目录，`metadrive/` 是底层环境代码
+- 如果你想做统一对比实验，建议固定 `config.py` 后只通过命令行切换 `--experiment_mode` 和 `--exp_name`

@@ -1,0 +1,9 @@
+[
+  {"name": "a1_d0p10", "num_agents": 1, "traffic_density": 0.10},
+  {"name": "a2_d0p10", "num_agents": 2, "traffic_density": 0.10},
+  {"name": "a3_d0p10", "num_agents": 3, "traffic_density": 0.10},
+  {"name": "a4_d0p10", "num_agents": 4, "traffic_density": 0.10},
+  {"name": "a5_d0p10", "num_agents": 5, "traffic_density": 0.10},
+  {"name": "a6_d0p10", "num_agents": 6, "traffic_density": 0.10},
+  {"name": "a8_d0p10", "num_agents": 8, "traffic_density": 0.10}
+]

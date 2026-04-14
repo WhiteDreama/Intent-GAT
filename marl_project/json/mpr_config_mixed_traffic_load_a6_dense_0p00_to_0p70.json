@@ -1,0 +1,17 @@
+[
+  {"name": "a6_d0p00", "num_agents": 6, "traffic_density": 0.00},
+  {"name": "a6_d0p05", "num_agents": 6, "traffic_density": 0.05},
+  {"name": "a6_d0p10", "num_agents": 6, "traffic_density": 0.10},
+  {"name": "a6_d0p15", "num_agents": 6, "traffic_density": 0.15},
+  {"name": "a6_d0p20", "num_agents": 6, "traffic_density": 0.20},
+  {"name": "a6_d0p25", "num_agents": 6, "traffic_density": 0.25},
+  {"name": "a6_d0p30", "num_agents": 6, "traffic_density": 0.30},
+  {"name": "a6_d0p35", "num_agents": 6, "traffic_density": 0.35},
+  {"name": "a6_d0p40", "num_agents": 6, "traffic_density": 0.40},
+  {"name": "a6_d0p45", "num_agents": 6, "traffic_density": 0.45},
+  {"name": "a6_d0p50", "num_agents": 6, "traffic_density": 0.50},
+  {"name": "a6_d0p55", "num_agents": 6, "traffic_density": 0.55},
+  {"name": "a6_d0p60", "num_agents": 6, "traffic_density": 0.60},
+  {"name": "a6_d0p65", "num_agents": 6, "traffic_density": 0.65},
+  {"name": "a6_d0p70", "num_agents": 6, "traffic_density": 0.70}
+]

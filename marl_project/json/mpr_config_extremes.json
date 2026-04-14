@@ -1,0 +1,11 @@
+[
+  {"name": "extreme_pure_rl_a1", "num_agents": 1, "traffic_density": 0.00},
+  {"name": "extreme_pure_rl_a8", "num_agents": 8, "traffic_density": 0.00},
+
+  {"name": "extreme_sparse_bg_a1_d0p01", "num_agents": 1, "traffic_density": 0.01},
+  {"name": "extreme_sparse_bg_a4_d0p01", "num_agents": 4, "traffic_density": 0.01},
+
+  {"name": "extreme_dense_bg_a1_d0p40", "num_agents": 1, "traffic_density": 0.40},
+  {"name": "extreme_dense_bg_a4_d0p40", "num_agents": 4, "traffic_density": 0.40},
+  {"name": "extreme_dense_bg_a8_d0p40", "num_agents": 8, "traffic_density": 0.40}
+]

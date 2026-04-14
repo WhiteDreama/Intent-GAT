@@ -4,7 +4,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
 from marl_project.config import Config
-from marl_project.modules import IntentEncoder, GraphAttention
+from marl_project.modules import (
+    IntentEncoder,
+    GraphAttention,
+    IPSMeanAggregator,
+    TarMACModule,
+    Where2CommRawAggregator,
+)
 
 
 # === [新增] 残差块定义 ===
@@ -41,7 +47,21 @@ class CooperativePolicy(nn.Module):
         
         # --- Modules ---
         self.encoder = IntentEncoder(input_dim)
-        self.gat = GraphAttention()
+        
+        # Communication module selection (GAT vs TarMAC)
+        self.comm_module_name = getattr(Config, "COMM_MODULE", "gat").lower()
+        self.uses_encoder_features = False
+        if self.comm_module_name == "none":
+            self.gat = None
+        elif self.comm_module_name == "tarmac":
+            self.gat = TarMACModule()
+        elif self.comm_module_name == "ips_mean":
+            self.gat = IPSMeanAggregator()
+        elif self.comm_module_name == "where2comm_raw":
+            self.gat = Where2CommRawAggregator()
+            self.uses_encoder_features = True
+        else:
+            self.gat = GraphAttention()
         
         # --- PPO Heads ---
         # Input to heads is [Ego_Z (32) + Context (32)] = 64
@@ -105,7 +125,7 @@ class CooperativePolicy(nn.Module):
             nn.init.constant_(module.bias, 0.0)
             nn.init.constant_(module.weight, 1.0)
         
-    def forward(self, obs_batch, action=None):
+    def forward(self, obs_batch, action=None, return_attention: bool = False):
         """
         The Full Pipeline Forward Pass.
         
@@ -128,15 +148,47 @@ class CooperativePolicy(nn.Module):
         # --- Step 1: Intent Encoding ---
         # z: (B, Intent_Dim)
         # pred_waypoints: (B, N, 2)
-        z, pred_waypoints = self.encoder(node_features)
+        if self.uses_encoder_features:
+            z, pred_waypoints, encoder_features = self.encoder(node_features, return_features=True)
+        else:
+            z, pred_waypoints = self.encoder(node_features)
+            encoder_features = None
         
         # --- Step 2: Gather Neighbor Intents ---
         # neighbor_zs: (B, Max_Neighbors, Intent_Dim)
-        neighbor_zs = self._gather_neighbor_intents(z, neighbor_indices)
+        neighbor_zs = self._gather_neighbor_features(z, neighbor_indices)
+        neighbor_encoder_features = (
+            self._gather_neighbor_features(encoder_features, neighbor_indices)
+            if encoder_features is not None
+            else None
+        )
         
         # --- Step 3: Graph Fusion (GAT) ---
         # context: (B, Intent_Dim)
-        context = self.gat(z, neighbor_zs, neighbor_rel_pos, neighbor_mask)
+        comm_inputs = (
+            (encoder_features, neighbor_encoder_features)
+            if self.uses_encoder_features
+            else (z, neighbor_zs)
+        )
+        if self.gat is None:
+            context = torch.zeros_like(z)
+            attention_weights = None
+            if return_attention:
+                attention_weights = torch.zeros(
+                    neighbor_mask.shape,
+                    dtype=z.dtype,
+                    device=z.device,
+                )
+        elif return_attention:
+            context, attention_weights = self.gat(
+                comm_inputs[0],
+                comm_inputs[1],
+                neighbor_rel_pos,
+                neighbor_mask,
+                return_attention=True,
+            )
+        else:
+            context = self.gat(comm_inputs[0], comm_inputs[1], neighbor_rel_pos, neighbor_mask)
         
         # --- Step 4: PPO Heads ---
         # Concatenate Ego Intent and Context
@@ -161,6 +213,9 @@ class CooperativePolicy(nn.Module):
             "pred_waypoints": pred_waypoints,
             "intent": z # Useful for visualization
         }
+
+        if return_attention:
+            results["attention_weights"] = attention_weights
         
         # Calculate Aux Loss if GT is available
         if 'gt_waypoints' in obs_batch:
@@ -186,16 +241,16 @@ class CooperativePolicy(nn.Module):
         with torch.no_grad():
             return self.forward(obs_batch)
 
-    def _gather_neighbor_intents(self, all_z, neighbor_indices):
+    def _gather_neighbor_features(self, all_features, neighbor_indices):
         """
-        Gathers z vectors for neighbors based on indices.
+        Gathers row features for neighbors based on indices.
         
         Args:
-            all_z: (B, Intent_Dim)
+            all_features: (B, D)
             neighbor_indices: (B, Max_Neighbors) - Indices in [0, B-1], -1 for padding
             
         Returns:
-            neighbor_zs: (B, Max_Neighbors, Intent_Dim)
+            gathered: (B, Max_Neighbors, D)
         """
         B, MaxN = neighbor_indices.shape
         # Handle padding indices (-1)
@@ -204,16 +259,31 @@ class CooperativePolicy(nn.Module):
         safe_indices = neighbor_indices.clone()
         safe_indices[safe_indices < 0] = 0
         
-        # Gather
-        # We want to select rows from all_z based on safe_indices
-        # all_z: (B, D)
-        # safe_indices: (B, N)
-        # Output: (B, N, D)
-        
-        # Expand all_z to be gather-able
-        # We can use simple indexing if we flatten or use advanced indexing
-        # neighbor_zs = all_z[safe_indices] works in PyTorch if safe_indices is LongTensor
-        
-        neighbor_zs = all_z[safe_indices]
-        
-        return neighbor_zs
+        gathered = all_features[safe_indices]
+        return gathered
+
+    def _gather_neighbor_intents(self, all_z, neighbor_indices):
+        return self._gather_neighbor_features(all_z, neighbor_indices)
+
+    def estimate_payload_bytes(self, obs_batch):
+        """Estimate communication bytes per agent-step under the current comm module."""
+        neighbor_mask = obs_batch["neighbor_mask"].to(dtype=torch.float32)
+        valid_counts = neighbor_mask.sum(dim=-1)
+
+        if self.comm_module_name in {"gat", "tarmac", "ips_mean"}:
+            message_dim = self.intent_dim
+            if self.comm_module_name == "ips_mean":
+                selected = torch.clamp(valid_counts, max=float(getattr(Config, "IPS_TOP_K", 3)))
+                return float((selected * message_dim * 4.0).mean().item())
+            return float((valid_counts * message_dim * 4.0).mean().item())
+
+        if self.comm_module_name == "where2comm_raw":
+            _, _, encoder_features = self.encoder(obs_batch["node_features"], return_features=True)
+            neighbor_encoder_features = self._gather_neighbor_features(encoder_features, obs_batch["neighbor_indices"])
+            gate_logits = self.gat.gate_proj(neighbor_encoder_features).squeeze(-1)
+            gate_probs = torch.sigmoid(gate_logits)
+            hard_gate = (gate_probs >= float(getattr(Config, "WHERE2COMM_GATE_THRESHOLD", 0.5))).to(dtype=neighbor_mask.dtype)
+            selected = (hard_gate * neighbor_mask).sum(dim=-1)
+            return float((selected * float(getattr(Config, "WHERE2COMM_RAW_DIM", 64)) * 4.0).mean().item())
+
+        return 0.0

@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os, sys
 os.environ["TORCHDYNAMO_DISABLE"] = "1"          # 彻底关闭 TorchDynamo
 # 可选：让 Dynamo 出错后自动回退到 eager，双保险
@@ -25,6 +26,7 @@ from torch.utils.tensorboard import SummaryWriter
 from marl_project.config import Config
 from marl_project.env_wrapper import GraphEnvWrapper
 from marl_project.models.policy import CooperativePolicy
+from marl_project.mappo_modules import MAPPOPolicy, reshape_for_centralized_critic
 from marl_project.mp_env import MultiProcEnv
 
 
@@ -232,13 +234,23 @@ def parse_args():
     parser.add_argument("--device", type=str, default="cuda:0", help="Device to use (cpu/cuda)")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     parser.add_argument("--max_time", type=int, default=30, help="Max wall-clock seconds to train before stopping")
+    parser.add_argument("--experiment_mode", type=str, default=None,
+                        choices=["ours", "oracle", "no_comm", "no_aux", "lidar_only", "mappo", "mappo_ips", "where2comm", "tarmac"],
+                        help="Override Config.EXPERIMENT_MODE (e.g. 'tarmac' for TarMAC baseline)")
     
     return parser.parse_args()
 
-def update_config(args):
+def update_config(args, explicit_args=None):
+    """Update Config from parsed args. Only override values explicitly passed on CLI."""
     for key, value in vars(args).items():
         key_upper = key.upper()
         if hasattr(Config, key_upper):
+            # Avoid clobbering defaults with None (e.g., exp_name not provided)
+            if value is None:
+                continue
+            # If we know which args were explicitly provided, skip defaults
+            if explicit_args is not None and key not in explicit_args:
+                continue
             setattr(Config, key_upper, value)
             print(f"Config updated: {key_upper} = {value}")
 
@@ -284,28 +296,34 @@ def _reset_with_seed(env, seed: int):
         return env.reset()
 
 
-def make_env(rank: int, seed: int):
+def make_env(rank: int, seed: int, experiment_mode: str = "ours"):
     """Factory for creating an environment.
 
     IMPORTANT (Windows spawn): do NOT return a local closure here, because it is not pickleable.
     We return a top-level callable object instead.
     """
-    return _EnvFactory(rank=rank, seed=seed)
+    return _EnvFactory(rank=rank, seed=seed, experiment_mode=experiment_mode)
 
 
 class _EnvFactory:
     """Pickle-friendly env factory for multiprocessing spawn."""
 
-    def __init__(self, rank: int, seed: int):
+    def __init__(self, rank: int, seed: int, experiment_mode: str = "ours"):
         self.rank = int(rank)
         self.seed = int(seed)
+        self.experiment_mode = str(experiment_mode)
 
     def __call__(self):
         # Import inside to avoid pickling issues and heavy imports in parent.
         from marl_project.config import Config
         from marl_project.env_wrapper import GraphEnvWrapper
 
-        env_cfg = Config.get_metadrive_config()
+        # === CRITICAL: 在子进程中也应用实验模式 ===
+        if hasattr(Config, 'apply_experiment_mode'):
+            Config.apply_experiment_mode(self.experiment_mode)
+        # =========================================
+
+        env_cfg = Config.get_metadrive_config(is_eval=False)
         env_cfg["start_seed"] = self.seed + self.rank
         env_cfg["num_scenarios"] = int(getattr(Config, "TRAIN_NUM_SCENARIOS", 10000))
         env_cfg["use_render"] = False
@@ -323,6 +341,17 @@ def train():
     np.random.seed(42)  # <--- 之前报错的就是这里
     
     args = parse_args()
+    
+    # === [新增] 应用实验模式配置 ===
+    # CLI --experiment_mode 优先于 Config.EXPERIMENT_MODE
+    if args.experiment_mode:
+        Config.EXPERIMENT_MODE = args.experiment_mode
+    experiment_mode = getattr(Config, "EXPERIMENT_MODE", "ours")
+    if hasattr(Config, 'apply_experiment_mode'):
+        Config.apply_experiment_mode(experiment_mode)
+    else:
+        print(f"⚠️ 警告: Config没有apply_experiment_mode方法，使用默认配置")
+    # =========================================
     
     # 1. 确定实验名称
     # 优先级：命令行参数 > Config默认值
@@ -343,8 +372,14 @@ def train():
     
     print(f"📂 本次训练日志将保存在: {log_dir}")
     
-    # 更新配置（如果有覆盖逻辑）
-    update_config(args)
+    # 更新配置（仅更新 CLI 显式传入的参数，避免覆盖 apply_experiment_mode 的设置）
+    # Detect which args were explicitly provided on CLI (not just defaults)
+    import shlex
+    _explicit = set()
+    for i, tok in enumerate(sys.argv[1:]):
+        if tok.startswith("--"):
+            _explicit.add(tok.lstrip("-").replace("-", "_"))
+    update_config(args, explicit_args=_explicit)
     
     # Save config for reproducibility
     # 确保能找到 config.py 文件，如果你的 train.py 和 config.py 在同一级目录：
@@ -369,7 +404,8 @@ def train():
     # --- Parallel envs (方案3: 自定义多进程采样器) ---
     num_envs = int(getattr(Config, "NUM_ENVS", 1))
     base_seed = int(getattr(Config, "BASE_SEED", 5000))
-    env_fns = [make_env(i, base_seed) for i in range(num_envs)]
+    # 传递实验模式到子进程
+    env_fns = [make_env(i, base_seed, experiment_mode=experiment_mode) for i in range(num_envs)]
 
     print(f"Using MultiProcEnv with {num_envs} workers (spawn)")
     envs = MultiProcEnv(env_fns)
@@ -414,13 +450,37 @@ def train():
         # Fallback to 2-dim continuous actions (steer, throttle/brake) if not inferable
         action_dim = 2
 
-    policy = CooperativePolicy(input_dim, action_dim).to(device)
+    # 检测是否为MAPPO模式
+    is_mappo = experiment_mode in {"mappo", "mappo_ips"}
+    if is_mappo:
+        policy = MAPPOPolicy(
+            input_dim=input_dim,
+            action_dim=action_dim,
+            num_agents=Config.NUM_AGENTS
+        ).to(device)
+        print(f"\n🎯 使用MAPPO策略 (Centralized Critic)")
+    else:
+        policy = CooperativePolicy(input_dim, action_dim).to(device)
+    
     optimizer = optim.Adam(policy.parameters(), lr=Config.LR)
     
-    print(f"Initialized Policy. Input: {input_dim}, Action: {action_dim}")
+    print(f"\n{'='*70}")
+    print(f"📊 模型初始化")
+    print(f"{'='*70}")
+    print(f"实验模式: {experiment_mode}")
+    print(f"LIDAR_NUM_OTHERS: {Config.LIDAR_NUM_OTHERS}")
+    print(f"环境输出维度: {input_dim}")
+    print(f"动作维度: {action_dim}")
+    print(f"预期维度 (oracle/lidar_only): 107, 预期维度 (ours/no_comm/no_aux): 91")
+    if experiment_mode in ["oracle", "lidar_only"] and input_dim != 107:
+        print(f"\n⚠️  警告: {experiment_mode}模式应该是107维，但环境输出{input_dim}维！")
+        print(f"   请检查Config.apply_experiment_mode()是否正确执行")
+    elif experiment_mode in ["ours", "no_comm", "no_aux", "mappo", "mappo_ips", "where2comm", "tarmac"] and input_dim != 91:
+        print(f"\n⚠️  警告: {experiment_mode}模式应该是91维，但环境输出{input_dim}维！")
+    print(f"{'='*70}\n")
     
     # --- Training Parameters ---
-    num_updates = 500
+    num_updates = 3000
     steps_per_update = Config.N_STEPS
     gamma = Config.GAMMA
     gae_lambda = 0.95
@@ -428,10 +488,32 @@ def train():
     max_grad_norm = args.grad_norm
     entropy_coef = args.entropy_coef
     vf_coef = args.vf_coef
+    value_clip = getattr(Config, 'VALUE_CLIP', 10.0)  # Value clipping to prevent explosion
     
     # Checkpointing
     best_reward = -float('inf')
+    best_success_rate = -float('inf')
     saved_checkpoints = deque(maxlen=3)
+
+    # --- Early stopping (optional) ---
+    early_stop_enabled = bool(getattr(Config, "EARLY_STOP_ENABLED", False))
+    early_stop_metric = str(getattr(Config, "EARLY_STOP_METRIC", "mean_episode_reward"))
+    early_stop_mode = str(getattr(Config, "EARLY_STOP_MODE", "max")).lower()
+    early_stop_window = int(getattr(Config, "EARLY_STOP_WINDOW_UPDATES", 5))
+    early_stop_warmup = int(getattr(Config, "EARLY_STOP_WARMUP_UPDATES", 30))
+    early_stop_patience = int(getattr(Config, "EARLY_STOP_PATIENCE_UPDATES", 30))
+    early_stop_min_delta = float(getattr(Config, "EARLY_STOP_MIN_DELTA", 0.0))
+
+    if early_stop_window <= 0:
+        early_stop_window = 1
+    if early_stop_patience <= 0:
+        early_stop_patience = 1
+    if early_stop_warmup < 0:
+        early_stop_warmup = 0
+
+    early_stop_hist = deque(maxlen=early_stop_window)
+    early_stop_best = None
+    early_stop_bad = 0
     
     # --- Main Loop ---
     start_update = 1
@@ -470,7 +552,11 @@ def train():
             print(f"Warning: Checkpoint {args.resume} not found. Starting from scratch.")
     
     wall_start = time.time()
-    for update in range(start_update, num_updates + 1):
+    print(f"\n🚀 开始训练循环: num_updates={num_updates}, steps_per_update={steps_per_update}")
+    print(f"   NUM_ENVS={num_envs}, 每个update总样本={num_envs * steps_per_update * Config.NUM_AGENTS}")
+    sys.stdout.flush()
+    try:  # Global try/except to catch ANY crash and print traceback
+      for update in range(start_update, num_updates + 1):
         if args.max_time and (time.time() - wall_start) >= args.max_time:
             print("Max wall-clock time reached, stopping.")
             break
@@ -495,7 +581,12 @@ def train():
             "SPEED_REWARD_SCALE": getattr(Config, "SPEED_REWARD_SCALE", 0.0),
             "OVERSPEED_PENALTY_SCALE": getattr(Config, "OVERSPEED_PENALTY_SCALE", 0.0),
         }
-        envs.env_method("update_config_params", curriculum_params)
+        try:
+            envs.env_method("update_config_params", curriculum_params)
+        except Exception as e:
+            print(f"\n❌ [Update {update}] env_method('update_config_params') failed: {e}")
+            import traceback; traceback.print_exc()
+            break
         # ==========================================
         
         # --- 1. Rollout Phase ---
@@ -510,6 +601,8 @@ def train():
             "aux_preds": [],
             "gt_waypoints": []
         }
+        if is_mappo:
+            buffer["global_obs"] = []
         
         # Reward Tracking
         completed_episode_rewards = []
@@ -524,10 +617,27 @@ def train():
         # diversify scenario indices deterministically within each worker's scenario range
         num_scenarios = int(getattr(Config, "TRAIN_NUM_SCENARIOS", 10000))
         reset_seeds = [int(base_seed + i + ((update - 1) % max(1, num_scenarios))) for i in range(num_envs)]
-        obs_list = envs.reset(seeds=reset_seeds)
+        try:
+            if update == start_update:
+                print(f"   [Update {update}] Resetting envs with seeds {reset_seeds[:2]}...")
+                sys.stdout.flush()
+            obs_list = envs.reset(seeds=reset_seeds)
+            if update == start_update:
+                print(f"   [Update {update}] Reset OK, agents per env: {[len(o) for o in obs_list]}")
+                sys.stdout.flush()
+        except Exception as e:
+            print(f"\n❌ [Update {update}] envs.reset() failed: {e}")
+            import traceback; traceback.print_exc()
+            break
         episode_rewards = [{a_id: 0.0 for a_id in obs} for obs in obs_list]
         
         for step in range(steps_per_update):
+            # Progress logging (first update only, every 200 steps)
+            if update == start_update and step % 200 == 0:
+                print(f"   [Update {update}] Rollout step {step}/{steps_per_update}")
+                sys.stdout.flush()
+            # Extra diagnostic: first 3 steps of first update
+            _diag = (update == start_update and step < 3)
             global_step += 1
             
             # Prepare batch for policy
@@ -590,6 +700,8 @@ def train():
                 "neighbor_rel_pos": torch.tensor(np.array(batch_neighbor_rel_pos), dtype=torch.float32),
                 "gt_waypoints": torch.tensor(np.array(batch_gt_waypoints), dtype=torch.float32)
             }
+            if _diag:
+                print(f"      [DIAG step {step}] Batch: {obs_tensor_batch['node_features'].shape}"); sys.stdout.flush()
 
             # Graph connectivity stats (how many valid neighbors per ego)
             try:
@@ -601,7 +713,36 @@ def train():
                 pass
             
             # Inference (using forward_actor_critic for no_grad)
-            results = policy.forward_actor_critic({k: v.to(device, non_blocking=True) for k, v in obs_tensor_batch.items()})
+            if is_mappo:
+                # 为MAPPO构建全局观测
+                # 需要按环境分组，因为每个环境的agent数量可能不同
+                global_obs_list = []
+                cursor = 0
+                for count in env_agent_counts:
+                    env_features = obs_tensor_batch["node_features"][cursor:cursor+count]  # (N, 91)
+                    # 确保每个环境固定为NUM_AGENTS个agent的观测
+                    if count < Config.NUM_AGENTS:
+                        # 不足的用0填充
+                        pad_size = Config.NUM_AGENTS - count
+                        padding = torch.zeros(pad_size, env_features.shape[1], dtype=env_features.dtype)
+                        env_features = torch.cat([env_features, padding], dim=0)
+                    elif count > Config.NUM_AGENTS:
+                        # 超出的截断（只取前NUM_AGENTS个）
+                        env_features = env_features[:Config.NUM_AGENTS]
+                    # Flatten为全局观测 (NUM_AGENTS * 91,)
+                    global_obs_list.append(env_features.flatten())
+                    cursor += count
+                
+                global_obs = torch.stack(global_obs_list, dim=0)  # (num_envs, NUM_AGENTS*91)
+                
+                results = policy.forward_actor_critic(
+                    {k: v.to(device, non_blocking=True) for k, v in obs_tensor_batch.items()},
+                    global_obs=global_obs.to(device, non_blocking=True)
+                )
+            else:
+                results = policy.forward_actor_critic({k: v.to(device, non_blocking=True) for k, v in obs_tensor_batch.items()})
+            if _diag:
+                print(f"      [DIAG step {step}] Forward OK"); sys.stdout.flush()
                 
             # Sample Actions
             action_mean = results["action_mean"]
@@ -609,7 +750,34 @@ def train():
             dist = torch.distributions.Normal(action_mean, action_std)
             actions = dist.sample()
             action_log_probs = dist.log_prob(actions).sum(dim=-1)
-            values = results["value"].squeeze(-1)
+            
+            # Value处理：MAPPO输出(num_envs, NUM_AGENTS)，需要提取实际agent的value
+            if is_mappo:
+                # 从(num_envs, NUM_AGENTS)中提取实际agent的value
+                # 同时截断actions和log_probs以匹配
+                values_list = []
+                actions_list = []
+                log_probs_list = []
+                cursor = 0
+                for env_idx, count in enumerate(env_agent_counts):
+                    actual_count = min(count, Config.NUM_AGENTS)
+                    # Value: 从(NUM_AGENTS,)中取实际数量
+                    env_values = results["value"][env_idx, :actual_count]
+                    values_list.append(env_values)
+                    # Actions和log_probs: 从总的actions中提取这个环境的
+                    actions_list.append(actions[cursor:cursor+actual_count])
+                    log_probs_list.append(action_log_probs[cursor:cursor+actual_count])
+                    cursor += count
+                
+                values = torch.cat(values_list, dim=0)  # (sum(actual_counts),)
+                # 重新组装actions和log_probs，只保留实际使用的
+                actions_actual = torch.cat(actions_list, dim=0)
+                action_log_probs_actual = torch.cat(log_probs_list, dim=0)
+            else:
+                values = results["value"].squeeze(-1)  # (B*N, 1) -> (B*N,)
+                actions_actual = actions
+                action_log_probs_actual = action_log_probs
+            
             aux_preds = results["pred_waypoints"]
             
             # Execute Step
@@ -618,15 +786,37 @@ def train():
             for env_idx, obs_dict in enumerate(obs_list):
                 count = env_agent_counts[env_idx]
                 env_action_dict = {}
-                for j, aid in enumerate(obs_dict.keys()):
-                    raw_act = actions[cursor + j].cpu().numpy()
-                    raw_act = clip_action(raw_act)
-                    env_action_dict[aid] = raw_act
+                if is_mappo:
+                    # MAPPO模式：只使用前NUM_AGENTS个agent的动作
+                    actual_count = min(count, Config.NUM_AGENTS)
+                    agent_ids = list(obs_dict.keys())[:actual_count]
+                    for j, aid in enumerate(agent_ids):
+                        # cursor现在指向actions_actual中的位置
+                        actual_cursor = sum([min(env_agent_counts[i], Config.NUM_AGENTS) for i in range(env_idx)]) + j
+                        raw_act = actions_actual[actual_cursor].cpu().numpy()
+                        raw_act = clip_action(raw_act)
+                        env_action_dict[aid] = raw_act
+                    # 其余agent用0动作（保持静止）
+                    for aid in list(obs_dict.keys())[actual_count:]:
+                        env_action_dict[aid] = clip_action(np.zeros(action_dim))
+                else:
+                    for j, aid in enumerate(obs_dict.keys()):
+                        raw_act = actions_actual[cursor + j].cpu().numpy()
+                        raw_act = clip_action(raw_act)
+                        env_action_dict[aid] = raw_act
                 env_actions.append(env_action_dict)
                 cursor += count
 
             # Parallel step
-            next_obs_list, rewards_list, dones_list, infos_list = envs.step(env_actions)
+            if _diag:
+                print(f"      [DIAG step {step}] Before envs.step()"); sys.stdout.flush()
+            try:
+                next_obs_list, rewards_list, dones_list, infos_list = envs.step(env_actions)
+            except Exception as e:
+                print(f"\n❌ [Update {update}, Step {step}] envs.step() failed: {e}")
+                import traceback; traceback.print_exc()
+                # Re-raise to break out of rollout loop
+                raise
 
             # Track Rewards
             for env_idx, obs_dict in enumerate(obs_list):
@@ -693,25 +883,91 @@ def train():
                             event_counts["idle_long"] += 1
 
             # Store in buffer
-            buffer["obs"].append({k: v.cpu() for k, v in obs_tensor_batch.items()})
-            buffer["actions"].append(actions.detach().cpu())
-            buffer["agent_ids"].append(active_agents)
+            # 对于MAPPO，需要截断obs以匹配实际使用的agent
+            if is_mappo:
+                obs_truncated = {}
+                cursor = 0
+                for key in obs_tensor_batch:
+                    obs_parts = []
+                    cursor_inner = 0
+                    for env_idx, count in enumerate(env_agent_counts):
+                        actual_count = min(count, Config.NUM_AGENTS)
+                        obs_parts.append(obs_tensor_batch[key][cursor_inner:cursor_inner+actual_count])
+                        cursor_inner += count
+                    obs_truncated[key] = torch.cat(obs_parts, dim=0)
+                buffer["obs"].append({k: v.cpu() for k, v in obs_truncated.items()})
+            else:
+                buffer["obs"].append({k: v.cpu() for k, v in obs_tensor_batch.items()})
+            
+            # 使用实际的actions和log_probs（MAPPO模式下已经截断）
+            buffer["actions"].append(actions_actual.detach().cpu())
+            
+            # MAPPO需要特殊处理：如果某些环境的agent被截断了，需要同步active_agents
+            if is_mappo:
+                # 重新构建active_agents，只包含被使用的agent（截断到NUM_AGENTS）
+                actual_active_agents = []
+                for env_idx, count in enumerate(env_agent_counts):
+                    # 对于MAPPO，每个环境最多取NUM_AGENTS个agent
+                    actual_count = min(count, Config.NUM_AGENTS)
+                    obs_dict = obs_list[env_idx]
+                    agent_ids = list(obs_dict.keys())[:actual_count]
+                    actual_active_agents.extend([f"{env_idx}:{aid}" for aid in agent_ids])
+                buffer["agent_ids"].append(actual_active_agents)
+            else:
+                buffer["agent_ids"].append(active_agents)
             
             # Store detached tensors for PPO update
             buffer["old_values"].append(values.detach().cpu())
-            buffer["old_logprobs"].append(action_log_probs.detach().cpu())
-            buffer["aux_preds"].append(aux_preds.detach().cpu())
-            buffer["gt_waypoints"].append(obs_tensor_batch["gt_waypoints"].detach())
+            buffer["old_logprobs"].append(action_log_probs_actual.detach().cpu())
+            
+            # MAPPO需要存储global_obs - 优化：只存储per-env，不存储per-agent（6倍显存节省）
+            if is_mappo:
+                # 只存储每个环境的global_obs（不复制到每个agent）
+                # global_obs: (num_envs, 546)
+                buffer["global_obs"].append(global_obs.detach().cpu())
+                
+                # 同时存储每个环境的agent数量，用于后续重建per-agent数据
+                if "env_agent_counts" not in buffer:
+                    buffer["env_agent_counts"] = []
+                buffer["env_agent_counts"].append(env_agent_counts.copy())
+            
+            # aux_preds和gt_waypoints也需要截断以匹配实际使用的agent数量
+            if is_mappo:
+                # 截断aux_preds和gt_waypoints
+                aux_preds_list = []
+                gt_waypoints_list = []
+                cursor = 0
+                for env_idx, count in enumerate(env_agent_counts):
+                    actual_count = min(count, Config.NUM_AGENTS)
+                    aux_preds_list.append(aux_preds[cursor:cursor+actual_count])
+                    gt_waypoints_list.append(obs_tensor_batch["gt_waypoints"][cursor:cursor+actual_count])
+                    cursor += count
+                buffer["aux_preds"].append(torch.cat(aux_preds_list, dim=0).detach().cpu())
+                buffer["gt_waypoints"].append(torch.cat(gt_waypoints_list, dim=0).detach())
+            else:
+                buffer["aux_preds"].append(aux_preds.detach().cpu())
+                buffer["gt_waypoints"].append(obs_tensor_batch["gt_waypoints"].detach())
             
             # Rewards and Dones
             flat_rewards = []
             flat_dones = []
-            for env_idx, obs_dict in enumerate(obs_list):
-                rewards = rewards_list[env_idx]
-                dones = dones_list[env_idx]
-                for a_id in obs_dict.keys():
-                    flat_rewards.append(rewards.get(a_id, 0.0))
-                    flat_dones.append(float(dones.get(a_id, False)))
+            if is_mappo:
+                # MAPPO模式：只收集实际使用的agent的reward和done
+                for env_idx, obs_dict in enumerate(obs_list):
+                    rewards = rewards_list[env_idx]
+                    dones = dones_list[env_idx]
+                    agent_ids = list(obs_dict.keys())[:min(len(obs_dict), Config.NUM_AGENTS)]
+                    for a_id in agent_ids:
+                        flat_rewards.append(rewards.get(a_id, 0.0))
+                        flat_dones.append(float(dones.get(a_id, False)))
+            else:
+                # 原有逻辑
+                for env_idx, obs_dict in enumerate(obs_list):
+                    rewards = rewards_list[env_idx]
+                    dones = dones_list[env_idx]
+                    for a_id in obs_dict.keys():
+                        flat_rewards.append(rewards.get(a_id, 0.0))
+                        flat_dones.append(float(dones.get(a_id, False)))
 
             buffer["rewards"].append(torch.tensor(flat_rewards, dtype=torch.float32))
             buffer["dones"].append(torch.tensor(flat_dones, dtype=torch.float32))
@@ -804,51 +1060,134 @@ def train():
             flat_returns.pin_memory(),
             flat_advantages.pin_memory()
         )
+        # 准备MAPPO的global_obs数据（高效扩展）
+        if is_mappo:
+            # Step 1: 拼接所有timesteps的global_obs
+            all_global_obs = torch.cat(buffer["global_obs"], dim=0).float()  # (num_envs_total, 546)
+            
+            # Step 2: 获取所有timesteps的agent数量信息
+            all_env_counts = [c for step_counts in buffer["env_agent_counts"] for c in step_counts]
+            
+            # Step 3: 高效扩展到per-agent（只在需要时复制）
+            flat_global_obs_list = []
+            env_idx = 0
+            for count in all_env_counts:
+                actual_count = min(count, Config.NUM_AGENTS)
+                # 复制该环境的global_obs actual_count次
+                env_global = all_global_obs[env_idx].unsqueeze(0).expand(actual_count, -1)
+                flat_global_obs_list.append(env_global)
+                env_idx += 1
+            flat_global_obs = torch.cat(flat_global_obs_list, dim=0)  # (total_agents, 546)
+            
+            dataset = TensorDataset(
+                flat_obs["node_features"].pin_memory(),
+                flat_obs["neighbor_indices"].pin_memory(),
+                flat_obs["neighbor_mask"].pin_memory(),
+                flat_obs["neighbor_rel_pos"].pin_memory(),
+                flat_obs["gt_waypoints"].pin_memory(),
+                flat_global_obs.pin_memory(),  # 添加global_obs
+                flat_actions.pin_memory(),
+                flat_old_logprobs.pin_memory(),
+                flat_old_values.pin_memory(),
+                flat_returns.pin_memory(),
+                flat_advantages.pin_memory()
+            )
+        
         loader = DataLoader(dataset, batch_size=Config.BATCH_SIZE, shuffle=True, drop_last=True, pin_memory=True)
 
         for _ in range(Config.PPO_EPOCHS):
-            for (b_nodes, b_nidx, b_nmask, b_nrel, b_gtw, b_actions, b_old_logprobs,
-                 b_old_values, b_returns, b_advantages) in loader:
-                obs_batch = {
-                    "node_features": b_nodes.to(device, non_blocking=True),
-                    "neighbor_indices": b_nidx.to(device, non_blocking=True),
-                    "neighbor_mask": b_nmask.to(device, non_blocking=True),
-                    "neighbor_rel_pos": b_nrel.to(device, non_blocking=True),
-                    "gt_waypoints": b_gtw.to(device, non_blocking=True),
-                }
+            if is_mappo:
+                for (b_nodes, b_nidx, b_nmask, b_nrel, b_gtw, b_global_obs, b_actions, b_old_logprobs,
+                     b_old_values, b_returns, b_advantages) in loader:
+                    obs_batch = {
+                        "node_features": b_nodes.to(device, non_blocking=True),
+                        "neighbor_indices": b_nidx.to(device, non_blocking=True),
+                        "neighbor_mask": b_nmask.to(device, non_blocking=True),
+                        "neighbor_rel_pos": b_nrel.to(device, non_blocking=True),
+                        "gt_waypoints": b_gtw.to(device, non_blocking=True),
+                    }
+                    global_obs_batch = b_global_obs.to(device, non_blocking=True)
 
-                results = policy(obs_batch, action=b_actions.to(device, non_blocking=True))
-                new_logprobs = results["action_log_probs"].squeeze()
-                dist_entropy = results["dist_entropy"].squeeze()
-                new_values = results["value"].squeeze()
-                aux_loss = results.get("aux_loss", torch.tensor(0.0, device=device))
+                    results = policy(obs_batch, global_obs=global_obs_batch, action=b_actions.to(device, non_blocking=True))
+                    new_logprobs = results["action_log_probs"]
+                    dist_entropy = results["dist_entropy"]
+                    # MAPPO的value已经是(B_agents,)形状，直接使用
+                    new_values = results["value"]
+                    aux_loss = results.get("aux_loss", torch.tensor(0.0, device=device))
 
-                ratio = torch.exp(new_logprobs - b_old_logprobs.to(device, non_blocking=True))
-                surr1 = ratio * b_advantages.to(device, non_blocking=True)
-                surr2 = torch.clamp(ratio, 1.0 - clip_epsilon, 1.0 + clip_epsilon) * b_advantages.to(device, non_blocking=True)
-                ppo_loss = -torch.min(surr1, surr2).mean()
+                    ratio = torch.exp(new_logprobs - b_old_logprobs.to(device, non_blocking=True))
+                    surr1 = ratio * b_advantages.to(device, non_blocking=True)
+                    surr2 = torch.clamp(ratio, 1.0 - clip_epsilon, 1.0 + clip_epsilon) * b_advantages.to(device, non_blocking=True)
+                    ppo_loss = -torch.min(surr1, surr2).mean()
 
-                b_returns_gpu = b_returns.to(device, non_blocking=True)
-                b_old_values_gpu = b_old_values.to(device, non_blocking=True)
-                v_clipped = b_old_values_gpu + torch.clamp(new_values - b_old_values_gpu, -clip_epsilon, clip_epsilon)
-                v_loss_unclipped = (new_values - b_returns_gpu) ** 2
-                v_loss_clipped = (v_clipped - b_returns_gpu) ** 2
-                value_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+                    b_returns_gpu = b_returns.to(device, non_blocking=True)
+                    b_old_values_gpu = b_old_values.to(device, non_blocking=True)
+                    # Clip value predictions to prevent explosion
+                    new_values = torch.clamp(new_values, -value_clip, value_clip)
+                    v_clipped = b_old_values_gpu + torch.clamp(new_values - b_old_values_gpu, -clip_epsilon, clip_epsilon)
+                    v_loss_unclipped = (new_values - b_returns_gpu) ** 2
+                    v_loss_clipped = (v_clipped - b_returns_gpu) ** 2
+                    value_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
 
-                entropy_loss = -dist_entropy.mean() * entropy_coef
-                step_loss = ppo_loss + vf_coef * value_loss + entropy_loss + current_aux_coef * aux_loss
+                    entropy_loss = -dist_entropy.mean() * entropy_coef
+                    step_loss = ppo_loss + vf_coef * value_loss + entropy_loss + current_aux_coef * aux_loss
 
-                optimizer.zero_grad()
-                step_loss.backward()
-                torch.nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
-                optimizer.step()
+                    optimizer.zero_grad()
+                    step_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
+                    optimizer.step()
 
-                total_ppo_loss += ppo_loss.item()
-                total_value_loss += value_loss.item()
-                total_aux_loss += aux_loss.item()
-                total_entropy += dist_entropy.mean().item()
-                total_loss += step_loss.item()
-                num_minibatches += 1
+                    total_ppo_loss += ppo_loss.item()
+                    total_value_loss += value_loss.item()
+                    total_aux_loss += aux_loss.item()
+                    total_entropy += dist_entropy.mean().item()
+                    total_loss += step_loss.item()
+                    num_minibatches += 1
+            else:
+                for (b_nodes, b_nidx, b_nmask, b_nrel, b_gtw, b_actions, b_old_logprobs,
+                     b_old_values, b_returns, b_advantages) in loader:
+                    obs_batch = {
+                        "node_features": b_nodes.to(device, non_blocking=True),
+                        "neighbor_indices": b_nidx.to(device, non_blocking=True),
+                        "neighbor_mask": b_nmask.to(device, non_blocking=True),
+                        "neighbor_rel_pos": b_nrel.to(device, non_blocking=True),
+                        "gt_waypoints": b_gtw.to(device, non_blocking=True),
+                    }
+
+                    results = policy(obs_batch, action=b_actions.to(device, non_blocking=True))
+                    new_logprobs = results["action_log_probs"].squeeze()
+                    dist_entropy = results["dist_entropy"].squeeze()
+                    new_values = results["value"].squeeze()
+                    aux_loss = results.get("aux_loss", torch.tensor(0.0, device=device))
+
+                    ratio = torch.exp(new_logprobs - b_old_logprobs.to(device, non_blocking=True))
+                    surr1 = ratio * b_advantages.to(device, non_blocking=True)
+                    surr2 = torch.clamp(ratio, 1.0 - clip_epsilon, 1.0 + clip_epsilon) * b_advantages.to(device, non_blocking=True)
+                    ppo_loss = -torch.min(surr1, surr2).mean()
+
+                    b_returns_gpu = b_returns.to(device, non_blocking=True)
+                    b_old_values_gpu = b_old_values.to(device, non_blocking=True)
+                    # Clip value predictions to prevent explosion
+                    new_values = torch.clamp(new_values, -value_clip, value_clip)
+                    v_clipped = b_old_values_gpu + torch.clamp(new_values - b_old_values_gpu, -clip_epsilon, clip_epsilon)
+                    v_loss_unclipped = (new_values - b_returns_gpu) ** 2
+                    v_loss_clipped = (v_clipped - b_returns_gpu) ** 2
+                    value_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+
+                    entropy_loss = -dist_entropy.mean() * entropy_coef
+                    step_loss = ppo_loss + vf_coef * value_loss + entropy_loss + current_aux_coef * aux_loss
+
+                    optimizer.zero_grad()
+                    step_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
+                    optimizer.step()
+
+                    total_ppo_loss += ppo_loss.item()
+                    total_value_loss += value_loss.item()
+                    total_aux_loss += aux_loss.item()
+                    total_entropy += dist_entropy.mean().item()
+                    total_loss += step_loss.item()
+                    num_minibatches += 1
             
         # --- Logging ---
             avg_divisor = max(1, num_minibatches)
@@ -870,10 +1209,14 @@ def train():
         writer.add_scalar("Graph/MeanValidNeighbors", float(graph_stats.get("neighbors_mean_sum", 0.0)) / g_n, global_step)
 
         # Terminal proportions (per-update)
-        term_denom = max(1, int(event_counts.get("terminal_total", 0)))
-        writer.add_scalar("Terminal/SuccessRate", float(event_counts.get("success", 0)) / term_denom, global_step)
-        writer.add_scalar("Terminal/CrashRate", float(event_counts.get("crash", 0)) / term_denom, global_step)
-        writer.add_scalar("Terminal/OutOfRoadRate", float(event_counts.get("out_of_road", 0)) / term_denom, global_step)
+        term_total = int(event_counts.get("terminal_total", 0))
+        term_denom = max(1, term_total)
+        success_rate = float(event_counts.get("success", 0)) / term_denom
+        crash_rate = float(event_counts.get("crash", 0)) / term_denom
+        out_of_road_rate = float(event_counts.get("out_of_road", 0)) / term_denom
+        writer.add_scalar("Terminal/SuccessRate", success_rate, global_step)
+        writer.add_scalar("Terminal/CrashRate", crash_rate, global_step)
+        writer.add_scalar("Terminal/OutOfRoadRate", out_of_road_rate, global_step)
         writer.add_scalar("Terminal/TimeoutRate", float(event_counts.get("timeout", 0)) / term_denom, global_step)
         writer.add_scalar("Terminal/OtherRate", float(event_counts.get("other", 0)) / term_denom, global_step)
         writer.add_scalar("Terminal/IdleLongRate", float(event_counts.get("idle_long", 0)) / term_denom, global_step)
@@ -912,6 +1255,29 @@ def train():
         if len(completed_episode_rewards) > 0:
             mean_ep_reward = np.mean(completed_episode_rewards)
             writer.add_scalar("Reward/Mean_Episode", mean_ep_reward, global_step)
+
+        # --- Early stopping: compute monitoring metric ---
+        # Note: rates are per-update and depend on terminal_total in this rollout.
+        metric_raw = None
+        if early_stop_metric == "mean_episode_reward":
+            metric_raw = float(mean_ep_reward)
+        elif early_stop_metric == "success_rate":
+            metric_raw = float(success_rate)
+        elif early_stop_metric == "-crash_rate":
+            metric_raw = -float(crash_rate)
+        elif early_stop_metric == "-out_of_road_rate":
+            metric_raw = -float(out_of_road_rate)
+        else:
+            # Fallback: keep training rather than crashing
+            metric_raw = float(mean_ep_reward)
+
+        early_stop_hist.append(float(metric_raw))
+        metric_smooth = float(np.mean(early_stop_hist)) if len(early_stop_hist) > 0 else float(metric_raw)
+
+        # Log early-stop tracking
+        writer.add_scalar("EarlyStop/MetricRaw", float(metric_raw), global_step)
+        writer.add_scalar("EarlyStop/MetricSmooth", float(metric_smooth), global_step)
+        writer.add_scalar("EarlyStop/BadCount", float(early_stop_bad), global_step)
         elapsed = max(1e-8, time.time() - wall_start)
         steps_per_sec = global_step / elapsed
         try:
@@ -922,7 +1288,10 @@ def train():
             f"Update {update}/{num_updates} | Loss: {avg_loss:.4f} | "
             f"PPO: {total_ppo_loss/avg_divisor:.4f} | V: {total_value_loss/avg_divisor:.4f} | "
             f"Ent: {total_entropy/avg_divisor:.4f} | Aux: {total_aux_loss/avg_divisor:.4f} | "
-            f"EpReward: {mean_ep_reward:.2f} | SPS: {steps_per_sec:.2f} | GPU%: {gpu_util}"
+            f"EpReward: {mean_ep_reward:.2f} | "
+            f"SR: {success_rate:.3f} CR: {crash_rate:.3f} OOR: {out_of_road_rate:.3f} (term={term_total}) | "
+            f"BestR: {best_reward:.2f} BestSR: {best_success_rate:.3f} | "
+            f"SPS: {steps_per_sec:.2f} | GPU%: {gpu_util}"
         )
         
         writer.add_scalar("Loss/Total", avg_loss, global_step)
@@ -938,12 +1307,64 @@ def train():
             torch.save(policy.state_dict(), f"{log_dir}/best_model.pth")
             print(f"New best model saved with reward {best_reward:.2f}")
 
+        # Save Best-Success Model (paper-facing)
+        # Use per-update success rate; if there is no terminal in this update, success_rate will be 0.
+        if success_rate > best_success_rate:
+            best_success_rate = float(success_rate)
+            torch.save(policy.state_dict(), f"{log_dir}/best_success_model.pth")
+            print(f"New best-success model saved with success_rate {best_success_rate:.3f}")
+
         # Save Last 3 Checkpoints
         if update % 50 == 0:
             ckpt_path = f"{log_dir}/ckpt_{update:06d}.pth"
             torch.save(policy.state_dict(), ckpt_path)
             saved_checkpoints.append(ckpt_path)
             print(f"Model saved at update {update}")
+
+        # --- Early stopping decision (after logging + saving) ---
+        if early_stop_enabled and update >= (start_update + early_stop_warmup):
+            # Initialize best on first eligible point
+            if early_stop_best is None:
+                early_stop_best = float(metric_smooth)
+                early_stop_bad = 0
+                print(
+                    f"[EarlyStop] init best={early_stop_best:.6f} "
+                    f"(metric={early_stop_metric}, mode={early_stop_mode}, window={early_stop_window})"
+                )
+            else:
+                improved = False
+                if early_stop_mode == "min":
+                    improved = float(metric_smooth) <= float(early_stop_best) - float(early_stop_min_delta)
+                else:
+                    # default: max
+                    improved = float(metric_smooth) >= float(early_stop_best) + float(early_stop_min_delta)
+
+                if improved:
+                    early_stop_best = float(metric_smooth)
+                    early_stop_bad = 0
+                    print(f"[EarlyStop] improved best={early_stop_best:.6f}")
+                else:
+                    early_stop_bad += 1
+                    print(
+                        f"[EarlyStop] no_improve={early_stop_bad}/{early_stop_patience} "
+                        f"(smooth={metric_smooth:.6f}, best={early_stop_best:.6f}, min_delta={early_stop_min_delta})"
+                    )
+
+                if early_stop_bad >= early_stop_patience:
+                    print(
+                        f"[EarlyStop] STOP: metric={early_stop_metric}, mode={early_stop_mode}, "
+                        f"best_smooth={early_stop_best:.6f}, last_smooth={metric_smooth:.6f}, "
+                        f"patience={early_stop_patience}"
+                    )
+                    break
+
+    except Exception as _global_exc:
+        print(f"\n{'!'*60}")
+        print(f"❌ 训练循环发生未捕获异常:")
+        print(f"{'!'*60}")
+        import traceback; traceback.print_exc()
+        print(f"{'!'*60}\n")
+        sys.stdout.flush()
 
     try:
         envs.close()

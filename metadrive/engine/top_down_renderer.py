@@ -29,7 +29,7 @@ def draw_top_down_map_native(
     film_size=(2000, 2000),
     scaling=None,
     semantic_broken_line=True
-) -> Optional[Union[np.ndarray, pygame.Surface]]:
+) -> Optional[Union[np.ndarray, object]]:
     """
     Draw the top_down map on a pygame surface
     Args:
@@ -186,6 +186,13 @@ class TopDownRenderer:
         target_agent_heading_up=False,
         target_vehicle_heading_up=None,
         draw_target_vehicle_trajectory=False,
+        draw_vehicle_trails=False,
+        vehicle_trail_width=2,
+        draw_pred_waypoints=False,
+        pred_waypoints_color=(255, 0, 0),
+        pred_waypoints_radius=3,
+        pred_waypoints_line_width=2,
+        pred_waypoints_world=None,
         semantic_map=False,
         draw_center_line=False,
         semantic_broken_line=True,
@@ -259,9 +266,40 @@ class TopDownRenderer:
         self.target_agent_heading_up = target_agent_heading_up
         self.show_agent_name = show_agent_name
         self.draw_target_vehicle_trajectory = draw_target_vehicle_trajectory
+        self.draw_vehicle_trails = draw_vehicle_trails
+        try:
+            self.vehicle_trail_width = max(1, int(vehicle_trail_width))
+        except Exception:
+            self.vehicle_trail_width = 2
+
+        self.draw_pred_waypoints = bool(draw_pred_waypoints)
+        try:
+            self.pred_waypoints_color = tuple(int(x) for x in pred_waypoints_color)
+        except Exception:
+            self.pred_waypoints_color = (255, 0, 0)
+        try:
+            self.pred_waypoints_radius = max(1, int(pred_waypoints_radius))
+        except Exception:
+            self.pred_waypoints_radius = 3
+        try:
+            self.pred_waypoints_line_width = max(1, int(pred_waypoints_line_width))
+        except Exception:
+            self.pred_waypoints_line_width = 2
+        self._pred_waypoints_world = None
+        # engine.render_topdown passes kwargs to __init__ on first call; accept initial overlay payload.
+        if pred_waypoints_world is not None:
+            self._pred_waypoints_world = pred_waypoints_world
         self.contour = draw_contour
         self.semantic_broken_line = semantic_broken_line
         self.no_window = not window
+
+        # Interactive view controls (only meaningful when window=True)
+        self._zoom = 1.0
+        self._zoom_min = 0.25
+        self._zoom_max = 8.0
+        self._pan_px = [0.0, 0.0]  # pan in canvas pixel space
+        self._dragging = False
+        self._last_mouse_pos = None
 
         if self.show_agent_name:
             pygame.init()
@@ -332,6 +370,30 @@ class TopDownRenderer:
     def render(self, text, to_image=True, *args, **kwargs):
         if "semantic_map" in kwargs:
             self.semantic_map = kwargs["semantic_map"]
+
+        # Optional predicted waypoint overlay (per-frame)
+        if "draw_pred_waypoints" in kwargs:
+            try:
+                self.draw_pred_waypoints = bool(kwargs["draw_pred_waypoints"])
+            except Exception:
+                pass
+        if "pred_waypoints_color" in kwargs:
+            try:
+                self.pred_waypoints_color = tuple(int(x) for x in kwargs["pred_waypoints_color"])
+            except Exception:
+                pass
+        if "pred_waypoints_radius" in kwargs:
+            try:
+                self.pred_waypoints_radius = max(1, int(kwargs["pred_waypoints_radius"]))
+            except Exception:
+                pass
+        if "pred_waypoints_line_width" in kwargs:
+            try:
+                self.pred_waypoints_line_width = max(1, int(kwargs["pred_waypoints_line_width"]))
+            except Exception:
+                pass
+        if "pred_waypoints_world" in kwargs:
+            self._pred_waypoints_world = kwargs.get("pred_waypoints_world")
 
         self.need_reset = False
         if not self.no_window:
@@ -466,6 +528,32 @@ class TopDownRenderer:
                     c = (c[0] + alpha_f * (255 - c[0]), c[1] + alpha_f * (255 - c[1]), c[2] + alpha_f * (255 - c[2]))
                 ObjectGraphics.display(object=v, surface=self._frame_canvas, heading=h, color=c, draw_contour=False)
 
+        # Draw vehicle trails as polylines (history trajectory), if enabled.
+        if self.draw_vehicle_trails and len(self.history_objects) >= 2:
+            try:
+                latest = self.history_objects[-1]
+                color_by_name = {obj.name: obj.color for obj in latest if getattr(obj, "type", None) == MetaDriveType.VEHICLE}
+                points_by_name = {}
+                for frame in self.history_objects:
+                    for obj in frame:
+                        if getattr(obj, "type", None) != MetaDriveType.VEHICLE:
+                            continue
+                        name = obj.name
+                        if name not in points_by_name:
+                            points_by_name[name] = []
+                        p = self._frame_canvas.pos2pix(obj.position[0], obj.position[1])
+                        points_by_name[name].append(p)
+
+                for name, pts in points_by_name.items():
+                    if len(pts) < 2:
+                        continue
+                    col = color_by_name.get(name, (0, 0, 0))
+                    # Slightly brighten the trail for visibility
+                    col = (min(255, int(col[0] * 0.7 + 60)), min(255, int(col[1] * 0.7 + 60)), min(255, int(col[2] * 0.7 + 60)))
+                    pygame.draw.lines(self._frame_canvas, col, False, pts, width=self.vehicle_trail_width)
+            except Exception:
+                pass
+
         # Draw the whole trajectory of ego vehicle with no gradient colors:
         if self.draw_target_vehicle_trajectory:
             for i, v in enumerate(self.history_target_vehicle):
@@ -504,6 +592,13 @@ class TopDownRenderer:
                 object=v, surface=self._frame_canvas, heading=h, color=c, draw_contour=self.contour, contour_width=2
             )
 
+        # Draw predicted waypoints (overlay) in world coordinates.
+        if self.draw_pred_waypoints and self._pred_waypoints_world is not None:
+            try:
+                self._draw_pred_waypoints_world(self._pred_waypoints_world)
+            except Exception:
+                pass
+
         if not hasattr(self, "_deads"):
             self._deads = []
 
@@ -538,8 +633,35 @@ class TopDownRenderer:
                     position = self._frame_canvas.pos2pix(*cam_pos)
             else:
                 position = (field[0] / 2, field[1] / 2)
-            off = (position[0] - field[0] / 2, position[1] - field[1] / 2)
-            self.screen_canvas.blit(source=canvas, dest=(0, 0), area=(off[0], off[1], field[0], field[1]))
+
+            # Apply interactive pan/zoom (pan is in canvas pixel space)
+            try:
+                position = (position[0] + self._pan_px[0], position[1] + self._pan_px[1])
+            except Exception:
+                pass
+
+            zoom = float(getattr(self, "_zoom", 1.0) or 1.0)
+            zoom = max(self._zoom_min, min(self._zoom_max, zoom))
+            self._zoom = zoom
+
+            view_w = field[0] / zoom
+            view_h = field[1] / zoom
+            canvas_w, canvas_h = canvas.get_size()
+            view_w = min(view_w, canvas_w)
+            view_h = min(view_h, canvas_h)
+            off_x = position[0] - view_w / 2
+            off_y = position[1] - view_h / 2
+            off_x = max(0, min(off_x, canvas_w - view_w))
+            off_y = max(0, min(off_y, canvas_h - view_h))
+
+            area = (int(off_x), int(off_y), int(view_w), int(view_h))
+            if int(view_w) == field[0] and int(view_h) == field[1]:
+                self.screen_canvas.blit(source=canvas, dest=(0, 0), area=area)
+            else:
+                tmp = pygame.Surface((int(view_w), int(view_h)))
+                tmp.blit(source=canvas, dest=(0, 0), area=area)
+                tmp2 = pygame.transform.smoothscale(tmp, field)
+                self.screen_canvas.blit(tmp2, (0, 0))
         else:
             position = self._frame_canvas.pos2pix(*v.position)
             area = (
@@ -598,6 +720,104 @@ class TopDownRenderer:
                 if event.key == pygame.K_ESCAPE:
                     import sys
                     sys.exit()
+
+            # Zoom controls
+            if event.type == pygame.MOUSEWHEEL:
+                try:
+                    factor = 1.1 ** float(event.y)
+                    self._zoom = max(self._zoom_min, min(self._zoom_max, self._zoom * factor))
+                except Exception:
+                    pass
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                # Compatibility with older pygame wheel events
+                if event.button == 4:
+                    self._zoom = max(self._zoom_min, min(self._zoom_max, self._zoom * 1.1))
+                elif event.button == 5:
+                    self._zoom = max(self._zoom_min, min(self._zoom_max, self._zoom / 1.1))
+                elif event.button == 1:
+                    self._dragging = True
+                    try:
+                        self._last_mouse_pos = pygame.mouse.get_pos()
+                    except Exception:
+                        self._last_mouse_pos = None
+            elif event.type == pygame.MOUSEBUTTONUP:
+                if event.button == 1:
+                    self._dragging = False
+                    self._last_mouse_pos = None
+            elif event.type == pygame.MOUSEMOTION:
+                if self._dragging:
+                    try:
+                        pos = pygame.mouse.get_pos()
+                        if self._last_mouse_pos is not None:
+                            dx = float(pos[0] - self._last_mouse_pos[0])
+                            dy = float(pos[1] - self._last_mouse_pos[1])
+                            # Dragging the view moves the camera opposite direction
+                            self._pan_px[0] -= dx / max(1e-6, float(self._zoom))
+                            self._pan_px[1] -= dy / max(1e-6, float(self._zoom))
+                        self._last_mouse_pos = pos
+                    except Exception:
+                        pass
+
+        # Keyboard panning (hold arrows)
+        try:
+            key_press = pygame.key.get_pressed()
+            pan_step = 20.0 / max(1e-6, float(self._zoom))
+            if key_press[pygame.K_LEFT]:
+                self._pan_px[0] -= pan_step
+            if key_press[pygame.K_RIGHT]:
+                self._pan_px[0] += pan_step
+            if key_press[pygame.K_UP]:
+                self._pan_px[1] -= pan_step
+            if key_press[pygame.K_DOWN]:
+                self._pan_px[1] += pan_step
+        except Exception:
+            pass
+
+    def _draw_pred_waypoints_world(self, pred_waypoints_world) -> None:
+        """Draw predicted waypoints on the frame canvas.
+
+        Expected formats:
+          - {agent_name: [[x,y], ...], ...}
+          - {agent_name: {"points": [[x,y], ...], "color": (r,g,b)}, ...}
+        Coordinates must be world (x,y) in meters.
+        """
+        if pred_waypoints_world is None:
+            return
+        if not isinstance(pred_waypoints_world, dict):
+            return
+
+        for _name, payload in pred_waypoints_world.items():
+            points = None
+            color = self.pred_waypoints_color
+            if isinstance(payload, dict):
+                points = payload.get("points")
+                if "color" in payload:
+                    try:
+                        color = tuple(int(x) for x in payload["color"])
+                    except Exception:
+                        color = self.pred_waypoints_color
+            else:
+                points = payload
+
+            if points is None:
+                continue
+            try:
+                pts_pix = [self._frame_canvas.pos2pix(float(p[0]), float(p[1])) for p in points]
+            except Exception:
+                continue
+            if len(pts_pix) == 0:
+                continue
+            # Connect waypoints with polyline, plus circles
+            if len(pts_pix) >= 2:
+                pygame.draw.lines(
+                    self._frame_canvas,
+                    color,
+                    False,
+                    pts_pix,
+                    width=self.pred_waypoints_line_width,
+                )
+            for p in pts_pix:
+                pygame.draw.circle(self._frame_canvas, color, p, self.pred_waypoints_radius)
 
     @property
     def engine(self):
